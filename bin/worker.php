@@ -143,8 +143,11 @@ $worker->onWorkerStart = function ($w) use (
     $_SERVER['HTTPS']          = 'on';
     $_SERVER['REQUEST_METHOD'] = 'GET';
 
+    require_once $wp_load;
+
     // Override wp_die so plugins that call it (e.g. WooCommerce privacy
     // cleanup) throw an exception instead of terminating the process.
+    // Must be after wp-load.php since add_filter isn't available before.
     add_filter('wp_die_handler', function () {
         return function ($message = '', $title = '', $args = []) {
             $msg = '';
@@ -156,8 +159,6 @@ $worker->onWorkerStart = function ($w) use (
             throw new \RuntimeException('wp_die called: ' . ($msg ?: $title ?: 'unknown'));
         };
     });
-
-    require_once $wp_load;
 
     Worker::log(sprintf('[W%d] WordPress bootstrapped. Primary domain: %s', $worker_id, $primary_domain));
 
