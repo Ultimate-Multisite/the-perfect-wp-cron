@@ -1,16 +1,18 @@
 <?php
 /**
- * Execute a single job in a fresh WordPress environment.
+ * Execute one or more jobs in a fresh WordPress environment.
  *
  * Spawned by worker.php as a subprocess. Bootstraps WordPress with the correct
  * site domain so all per-site plugins are loaded and DB tables are correct.
+ * Accepts a single payload (legacy) or an array of payloads for batch execution.
+ * All payloads in a batch must share the same site_id and site_url.
  *
  * Usage:
  *   php execute-job.php <base64-encoded-json-payload>
  *
  * Exit codes:
- *   0 = success
- *   1 = error
+ *   0 = all jobs succeeded
+ *   1 = one or more jobs failed
  */
 
 // Payload comes as base64-encoded JSON argument
@@ -19,11 +21,21 @@ if (!$raw) {
     fwrite(STDERR, "Missing or invalid base64 payload argument.\n");
     exit(1);
 }
-$payload = json_decode($raw, true);
-if (!is_array($payload) || empty($payload['hook'])) {
+$payload_data = json_decode($raw, true);
+if (!is_array($payload_data)) {
     fwrite(STDERR, "Invalid JSON payload.\n");
     exit(1);
 }
+
+// Normalize: single payload (has 'hook' key) → wrap in array
+$payloads = isset($payload_data['hook']) ? [$payload_data] : $payload_data;
+if (empty($payloads)) {
+    fwrite(STDERR, "Empty payload array.\n");
+    exit(1);
+}
+
+// Use first payload for site context (all share same site)
+$payload = $payloads[0];
 
 // --- Auto-discover vendor/autoload.php ---
 $autoload = null;
@@ -102,30 +114,36 @@ if ($site_id !== get_current_blog_id()) {
     switch_to_blog($site_id);
 }
 
-// --- Execute the job ---
-$source    = $payload['source'] ?? 'wp_cron';
-$hook      = $payload['hook'];
+// --- Execute jobs ---
 $exit_code = 0;
+$results   = [];
 
-try {
-    if ($source === 'action_scheduler') {
-        $action_id = (int) ($payload['action_id'] ?? 0);
-        if (!$action_id || !class_exists('ActionScheduler_QueueRunner')) {
-            throw new \RuntimeException('ActionScheduler not available or missing action_id');
+foreach ($payloads as $i => $job) {
+    $source = $job['source'] ?? 'wp_cron';
+    $hook   = $job['hook'];
+
+    try {
+        if ($source === 'action_scheduler') {
+            $action_id = (int) ($job['action_id'] ?? 0);
+            if (!$action_id || !class_exists('ActionScheduler_QueueRunner')) {
+                throw new \RuntimeException('ActionScheduler not available or missing action_id');
+            }
+            $runner = \ActionScheduler_QueueRunner::instance();
+            $runner->process_action($action_id);
+            $results[] = ['status' => 'ok', 'type' => 'as', 'action_id' => $action_id, 'hook' => $hook];
+        } else {
+            $timestamp = (int) ($job['timestamp'] ?? 0);
+            $args      = $job['args'] ?? [];
+            wp_unschedule_event($timestamp, $hook, $args);
+            do_action_ref_array($hook, $args);
+            $results[] = ['status' => 'ok', 'type' => 'cron', 'hook' => $hook];
         }
-        $runner = \ActionScheduler_QueueRunner::instance();
-        $runner->process_action($action_id);
-        echo json_encode(['status' => 'ok', 'type' => 'as', 'action_id' => $action_id, 'hook' => $hook]);
-    } else {
-        $timestamp = (int) ($payload['timestamp'] ?? 0);
-        $args      = $payload['args'] ?? [];
-        wp_unschedule_event($timestamp, $hook, $args);
-        do_action_ref_array($hook, $args);
-        echo json_encode(['status' => 'ok', 'type' => 'cron', 'hook' => $hook]);
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "[Job $i] {$hook}: " . $e->getMessage() . "\n");
+        $results[] = ['status' => 'error', 'hook' => $hook, 'error' => $e->getMessage()];
+        $exit_code = 1;
     }
-} catch (\Throwable $e) {
-    fwrite(STDERR, $e->getMessage() . "\n");
-    $exit_code = 1;
 }
 
+echo json_encode($results);
 exit($exit_code);

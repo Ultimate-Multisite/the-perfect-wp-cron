@@ -85,8 +85,8 @@ use Workerman\Timer;
 // --- Configuration ---
 $socket_path     = getenv('QUEUE_WORKER_SOCKET_PATH') ?: '/tmp/wp-queue-worker.sock';
 $primary_domain  = getenv('DOMAIN_CURRENT_SITE') ?: 'localhost';
-$worker_count    = (int) (getenv('QUEUE_WORKER_COUNT') ?: 4);
-$max_concurrent  = (int) (getenv('QUEUE_WORKER_MAX_CONCURRENT') ?: 2); // per worker process
+$worker_count    = (int) (getenv('QUEUE_WORKER_COUNT') ?: 2);
+$max_concurrent  = (int) (getenv('QUEUE_WORKER_MAX_CONCURRENT') ?: 1); // per worker process
 $job_timeout     = 300;   // seconds — subprocess hard limit
 $rescan_interval = 60;    // seconds between DB rescans
 $memory_limit    = 200;   // MB — restart if exceeded
@@ -97,7 +97,8 @@ $execute_script = __DIR__ . '/execute-job.php';
 
 // --- Per-process State (each forked child gets its own copy) ---
 $pending_timers    = [];   // tracking_key => timer_id
-$running_processes = [];   // index => ['process', 'pipes', 'payload', 'started', 'output']
+$running_processes = [];   // index => ['process', 'pipes', 'payloads', 'started', 'stdout', 'stderr']
+$pending_batch     = [];   // site_id => [payload, payload, ...]
 $running_jobs      = 0;
 $start_time        = time();
 
@@ -122,6 +123,7 @@ $worker->onWorkerStart = function ($w) use (
     $execute_script,
     &$pending_timers,
     &$running_processes,
+    &$pending_batch,
     &$running_jobs,
     &$start_time,
     $max_concurrent,
@@ -152,14 +154,18 @@ $worker->onWorkerStart = function ($w) use (
 
     ensure_lock_table();
 
-    // --- Spawn a subprocess to execute a job ---
-    $spawn_job = function ($payload) use (
+    // --- Spawn a subprocess to execute a batch of jobs (all same site) ---
+    $spawn_batch = function (array $payloads) use (
         &$running_processes,
         &$running_jobs,
         $worker_id,
         $execute_script
     ) {
-        $json_b64 = base64_encode($payload->to_json());
+        $json_array = array_map(
+            fn($p) => json_decode($p->to_json(), true),
+            $payloads
+        );
+        $json_b64 = base64_encode(json_encode($json_array));
         $cmd = sprintf(
             'php %s %s',
             escapeshellarg($execute_script),
@@ -174,10 +180,10 @@ $worker->onWorkerStart = function ($w) use (
 
         if (!is_resource($process)) {
             Worker::log(sprintf(
-                '[W%d][ERROR] Failed to spawn subprocess for %s on site %d',
+                '[W%d][ERROR] Failed to spawn subprocess for batch of %d jobs on site %d',
                 $worker_id,
-                $payload->hook,
-                $payload->site_id
+                count($payloads),
+                $payloads[0]->site_id
             ));
             return;
         }
@@ -188,32 +194,32 @@ $worker->onWorkerStart = function ($w) use (
 
         $running_jobs++;
         $running_processes[] = [
-            'process' => $process,
-            'pipes'   => $pipes,
-            'payload' => $payload,
-            'started' => time(),
-            'stdout'  => '',
-            'stderr'  => '',
+            'process'  => $process,
+            'pipes'    => $pipes,
+            'payloads' => $payloads,
+            'started'  => time(),
+            'stdout'   => '',
+            'stderr'   => '',
         ];
 
+        $hooks = array_map(fn($p) => $p->hook, $payloads);
         Worker::log(sprintf(
-            '[W%d][SPAWN] %s %s on site %d (pid %d, %d running)',
+            '[W%d][SPAWN] Batch: %d jobs on site %d (pid %d, %d running): %s',
             $worker_id,
-            $payload->source === 'action_scheduler' ? "AS #{$payload->action_id}:" : 'Cron:',
-            $payload->hook,
-            $payload->site_id,
+            count($payloads),
+            $payloads[0]->site_id,
             proc_get_status($process)['pid'] ?? 0,
-            $running_jobs
+            $running_jobs,
+            implode(', ', array_unique($hooks))
         ));
     };
 
-    // --- Job execution callback (fired by timer) ---
+    // --- Job execution callback (fired by timer) — collects into batch ---
     $execute_job = function ($payload) use (
         &$pending_timers,
+        &$pending_batch,
         &$running_processes,
-        &$running_jobs,
-        $max_concurrent,
-        $spawn_job
+        $max_concurrent
     ) {
         $key = $payload->tracking_key();
         unset($pending_timers[$key]);
@@ -232,7 +238,8 @@ $worker->onWorkerStart = function ($w) use (
             return;
         }
 
-        $spawn_job($payload);
+        // Collect into pending batch — flushed by the batch timer
+        $pending_batch[$payload->site_id][] = $payload;
     };
 
     $GLOBALS['__execute_job'] = $execute_job;
@@ -249,6 +256,21 @@ $worker->onWorkerStart = function ($w) use (
     };
 
     $GLOBALS['__schedule_timer'] = $schedule_timer;
+
+    // --- Flush pending batches every 1 second ---
+    Timer::add(1, function () use (&$pending_batch, &$running_processes, $max_concurrent, $spawn_batch) {
+        foreach ($pending_batch as $site_id => $payloads) {
+            if (empty($payloads)) {
+                unset($pending_batch[$site_id]);
+                continue;
+            }
+            if (count($running_processes) >= $max_concurrent) {
+                break;
+            }
+            $spawn_batch($payloads);
+            unset($pending_batch[$site_id]);
+        }
+    });
 
     // --- Poll running subprocesses for completion ---
     Timer::add(0.5, function () use (&$running_processes, &$running_jobs, $worker_id, $job_timeout) {
@@ -281,31 +303,29 @@ $worker->onWorkerStart = function ($w) use (
                 proc_close($proc['process']);
 
                 $exit_code = $status['exitcode'];
-                $payload   = $proc['payload'];
+                $payloads  = $proc['payloads'];
                 $elapsed   = time() - $proc['started'];
-                $label     = $payload->source === 'action_scheduler'
-                    ? "AS #{$payload->action_id}: {$payload->hook}"
-                    : "Cron: {$payload->hook}";
+                $site_id   = $payloads[0]->site_id;
+                $count     = count($payloads);
 
                 if ($exit_code === 0) {
                     Worker::log(sprintf(
-                        '[W%d][DONE] %s on site %d (%ds)',
+                        '[W%d][DONE] Batch: %d jobs on site %d (%ds)',
                         $worker_id,
-                        $label,
-                        $payload->site_id,
+                        $count,
+                        $site_id,
                         $elapsed
                     ));
                 } else {
                     $error_msg = trim($running_processes[$i]['stderr'] ?: $running_processes[$i]['stdout']);
-                    // Truncate long error messages
                     if (strlen($error_msg) > 500) {
                         $error_msg = substr($error_msg, 0, 500) . '...';
                     }
                     Worker::log(sprintf(
-                        '[W%d][FAIL] %s on site %d (exit %d, %ds): %s',
+                        '[W%d][FAIL] Batch: %d jobs on site %d (exit %d, %ds): %s',
                         $worker_id,
-                        $label,
-                        $payload->site_id,
+                        $count,
+                        $site_id,
                         $exit_code,
                         $elapsed,
                         $error_msg
@@ -319,7 +339,7 @@ $worker->onWorkerStart = function ($w) use (
 
             // Timeout check
             if (time() - $proc['started'] > $job_timeout) {
-                $payload = $proc['payload'];
+                $payloads = $proc['payloads'];
                 $pid = $status['pid'];
                 proc_terminate($proc['process'], 9);
                 fclose($proc['pipes'][1]);
@@ -327,10 +347,10 @@ $worker->onWorkerStart = function ($w) use (
                 proc_close($proc['process']);
 
                 Worker::log(sprintf(
-                    '[W%d][TIMEOUT] %s on site %d exceeded %ds limit (pid %d)',
+                    '[W%d][TIMEOUT] Batch: %d jobs on site %d exceeded %ds limit (pid %d)',
                     $worker_id,
-                    $payload->hook,
-                    $payload->site_id,
+                    count($payloads),
+                    $payloads[0]->site_id,
                     $job_timeout,
                     $pid
                 ));
