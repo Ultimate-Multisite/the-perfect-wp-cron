@@ -147,6 +147,15 @@ $worker->onWorkerStart = function ($w) use (
 
     Worker::log(sprintf('[W%d] WordPress bootstrapped. Primary domain: %s', $worker_id, $primary_domain));
 
+    // Load plugins active on other sites that weren't loaded during bootstrap.
+    // WordPress only loads plugins active on the primary site. switch_to_blog()
+    // only changes the DB prefix, it doesn't reload plugins. This ensures all
+    // Action Scheduler callbacks are registered regardless of which site owns the job.
+    $extra = load_network_plugins();
+    if ($extra > 0) {
+        Worker::log(sprintf('[W%d] Loaded %d additional plugin(s) from other network sites.', $worker_id, $extra));
+    }
+
     // Ensure the lock table exists (idempotent)
     ensure_lock_table();
 
@@ -311,6 +320,102 @@ function ensure_lock_table(): void
         claimed_at DATETIME NOT NULL
     ) ENGINE=InnoDB"
     );
+}
+
+/**
+ * Load plugins that are active on other network sites but weren't loaded
+ * during the primary site's bootstrap.
+ *
+ * WordPress only loads plugins for the bootstrapped site. In multisite,
+ * switch_to_blog() only swaps the DB prefix — it doesn't reload plugins.
+ * This means Action Scheduler callbacks registered by per-site plugins
+ * (not network-activated) would be missing when executing jobs for those sites.
+ *
+ * This function:
+ * 1. Collects all active plugins across every site in the network
+ * 2. Includes any plugin files not already loaded
+ * 3. Fires their newly-registered callbacks for bootstrap actions that
+ *    have already completed (plugins_loaded, after_setup_theme, init, wp_loaded)
+ *
+ * @return int Number of additional plugins loaded.
+ */
+function load_network_plugins(): int
+{
+    global $wp_filter;
+
+    if (!is_multisite()) {
+        return 0;
+    }
+
+    // Collect all unique active plugins across every site
+    $all_plugins = [];
+    $sites = get_sites(['number' => 0, 'fields' => 'ids']);
+    foreach ($sites as $site_id) {
+        switch_to_blog($site_id);
+        foreach (get_option('active_plugins', []) as $plugin) {
+            $all_plugins[$plugin] = true;
+        }
+        restore_current_blog();
+    }
+
+    // Build a lookup of already-included files (normalized to realpath)
+    $included = [];
+    foreach (get_included_files() as $f) {
+        $included[$f] = true;
+    }
+
+    // Actions that have already fired during bootstrap — we'll need to
+    // manually invoke any new callbacks these freshly-loaded plugins register
+    $bootstrap_actions = ['plugins_loaded', 'after_setup_theme', 'init', 'wp_loaded'];
+
+    $loaded_count = 0;
+
+    foreach (array_keys($all_plugins) as $plugin) {
+        $file = WP_PLUGIN_DIR . '/' . $plugin;
+        if (!file_exists($file)) {
+            continue;
+        }
+
+        // Skip if already included
+        $real = realpath($file);
+        if ($real && isset($included[$real])) {
+            continue;
+        }
+
+        // Snapshot current callbacks for bootstrap actions
+        $before = [];
+        foreach ($bootstrap_actions as $action) {
+            if (isset($wp_filter[$action])) {
+                $before[$action] = [];
+                foreach ($wp_filter[$action]->callbacks as $pri => $cbs) {
+                    $before[$action][$pri] = array_keys($cbs);
+                }
+            }
+        }
+
+        include_once $file;
+        $loaded_count++;
+
+        // Fire any newly registered callbacks for already-completed actions.
+        // Example: a plugin that hooks after_setup_theme to call its setup()
+        // function — that action already fired, so we invoke the new callback now.
+        foreach ($bootstrap_actions as $action) {
+            if (!did_action($action) || !isset($wp_filter[$action])) {
+                continue;
+            }
+            foreach ($wp_filter[$action]->callbacks as $pri => $cbs) {
+                foreach ($cbs as $id => $cb) {
+                    if (isset($before[$action][$pri]) && in_array($id, $before[$action][$pri], true)) {
+                        continue;
+                    }
+                    // New callback — invoke it
+                    call_user_func($cb['function']);
+                }
+            }
+        }
+    }
+
+    return $loaded_count;
 }
 
 function execute_cron_job(\QueueWorker\Job_Payload $payload, int $worker_id): void
