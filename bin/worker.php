@@ -87,8 +87,8 @@ $socket_path     = getenv('QUEUE_WORKER_SOCKET_PATH') ?: '/tmp/wp-queue-worker.s
 $primary_domain  = getenv('DOMAIN_CURRENT_SITE') ?: 'localhost';
 $worker_count    = (int) (getenv('QUEUE_WORKER_COUNT') ?: 2);
 $max_concurrent  = (int) (getenv('QUEUE_WORKER_MAX_CONCURRENT') ?: 1); // per worker process
-$job_timeout     = 300;   // seconds — subprocess hard limit
-$max_batch_size  = (int) (getenv('QUEUE_WORKER_MAX_BATCH_SIZE') ?: 3); // max jobs per subprocess batch
+$batch_timeout   = 3600;  // seconds — subprocess safety net (per-job timeout is in execute-job.php)
+$max_batch_size  = (int) (getenv('QUEUE_WORKER_MAX_BATCH_SIZE') ?: 50); // max jobs per subprocess batch
 $rescan_interval = 60;    // seconds between DB rescans
 $memory_limit    = 200;   // MB — restart if exceeded
 $uptime_limit    = 3600;  // seconds — restart after 1 hour
@@ -129,7 +129,7 @@ $worker->onWorkerStart = function ($w) use (
     &$start_time,
     $max_concurrent,
     $max_batch_size,
-    $job_timeout,
+    $batch_timeout,
     $rescan_interval,
     $memory_limit,
     $uptime_limit
@@ -277,7 +277,7 @@ $worker->onWorkerStart = function ($w) use (
     });
 
     // --- Poll running subprocesses for completion ---
-    Timer::add(0.5, function () use (&$running_processes, &$running_jobs, $worker_id, $job_timeout) {
+    Timer::add(0.5, function () use (&$running_processes, &$running_jobs, $worker_id, $batch_timeout) {
         foreach ($running_processes as $i => $proc) {
             // Read available output
             $out = stream_get_contents($proc['pipes'][1]);
@@ -342,7 +342,7 @@ $worker->onWorkerStart = function ($w) use (
             }
 
             // Timeout check
-            if (time() - $proc['started'] > $job_timeout) {
+            if (time() - $proc['started'] > $batch_timeout) {
                 $payloads = $proc['payloads'];
                 $pid = $status['pid'];
                 proc_terminate($proc['process'], 9);
@@ -355,7 +355,7 @@ $worker->onWorkerStart = function ($w) use (
                     $worker_id,
                     count($payloads),
                     $payloads[0]->site_id,
-                    $job_timeout,
+                    $batch_timeout,
                     $pid
                 ));
 

@@ -118,13 +118,28 @@ if ($site_id !== get_current_blog_id()) {
     switch_to_blog($site_id);
 }
 
-// --- Execute jobs ---
-$exit_code = 0;
-$results   = [];
+// --- Execute jobs with per-job timeout ---
+$exit_code   = 0;
+$results     = [];
+$job_timeout = (int) (getenv('QUEUE_WORKER_JOB_TIMEOUT') ?: 300);
+
+// Enable per-job timeout via SIGALRM
+$has_pcntl = function_exists('pcntl_async_signals');
+if ($has_pcntl) {
+    pcntl_async_signals(true);
+}
 
 foreach ($payloads as $i => $job) {
     $source = $job['source'] ?? 'wp_cron';
     $hook   = $job['hook'];
+
+    // Set per-job alarm
+    if ($has_pcntl) {
+        pcntl_signal(SIGALRM, function () {
+            throw new \RuntimeException('Per-job timeout exceeded');
+        });
+        pcntl_alarm($job_timeout);
+    }
 
     try {
         if ($source === 'action_scheduler') {
@@ -146,6 +161,11 @@ foreach ($payloads as $i => $job) {
         fwrite(STDERR, "[Job $i] {$hook}: " . $e->getMessage() . "\n");
         $results[] = ['status' => 'error', 'hook' => $hook, 'error' => $e->getMessage()];
         $exit_code = 1;
+    }
+
+    // Cancel pending alarm
+    if ($has_pcntl) {
+        pcntl_alarm(0);
     }
 }
 
