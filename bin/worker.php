@@ -88,6 +88,7 @@ $primary_domain  = getenv('DOMAIN_CURRENT_SITE') ?: 'localhost';
 $worker_count    = (int) (getenv('QUEUE_WORKER_COUNT') ?: 2);
 $max_concurrent  = (int) (getenv('QUEUE_WORKER_MAX_CONCURRENT') ?: 1); // per worker process
 $job_timeout     = 300;   // seconds — subprocess hard limit
+$max_batch_size  = 25;    // max jobs per subprocess batch
 $rescan_interval = 60;    // seconds between DB rescans
 $memory_limit    = 200;   // MB — restart if exceeded
 $uptime_limit    = 3600;  // seconds — restart after 1 hour
@@ -127,6 +128,7 @@ $worker->onWorkerStart = function ($w) use (
     &$running_jobs,
     &$start_time,
     $max_concurrent,
+    $max_batch_size,
     $job_timeout,
     $rescan_interval,
     $memory_limit,
@@ -165,12 +167,8 @@ $worker->onWorkerStart = function ($w) use (
             fn($p) => json_decode($p->to_json(), true),
             $payloads
         );
-        $json_b64 = base64_encode(json_encode($json_array));
-        $cmd = sprintf(
-            'php %s %s',
-            escapeshellarg($execute_script),
-            escapeshellarg($json_b64)
-        );
+        $json_data = json_encode($json_array);
+        $cmd = sprintf('php %s --stdin', escapeshellarg($execute_script));
 
         $process = proc_open($cmd, [
             0 => ['pipe', 'r'],
@@ -188,7 +186,9 @@ $worker->onWorkerStart = function ($w) use (
             return;
         }
 
-        fclose($pipes[0]); // close stdin
+        // Write JSON payload to stdin, then close
+        fwrite($pipes[0], $json_data);
+        fclose($pipes[0]);
         stream_set_blocking($pipes[1], false);
         stream_set_blocking($pipes[2], false);
 
@@ -258,7 +258,7 @@ $worker->onWorkerStart = function ($w) use (
     $GLOBALS['__schedule_timer'] = $schedule_timer;
 
     // --- Flush pending batches every 1 second ---
-    Timer::add(1, function () use (&$pending_batch, &$running_processes, $max_concurrent, $spawn_batch) {
+    Timer::add(1, function () use (&$pending_batch, &$running_processes, $max_concurrent, $max_batch_size, $spawn_batch) {
         foreach ($pending_batch as $site_id => $payloads) {
             if (empty($payloads)) {
                 unset($pending_batch[$site_id]);
@@ -267,8 +267,12 @@ $worker->onWorkerStart = function ($w) use (
             if (count($running_processes) >= $max_concurrent) {
                 break;
             }
-            $spawn_batch($payloads);
-            unset($pending_batch[$site_id]);
+            // Take at most max_batch_size from the front
+            $batch = array_splice($pending_batch[$site_id], 0, $max_batch_size);
+            $spawn_batch($batch);
+            if (empty($pending_batch[$site_id])) {
+                unset($pending_batch[$site_id]);
+            }
         }
     });
 

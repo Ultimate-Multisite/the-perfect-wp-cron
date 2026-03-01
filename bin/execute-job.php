@@ -15,10 +15,14 @@
  *   1 = one or more jobs failed
  */
 
-// Payload comes as base64-encoded JSON argument
-$raw = base64_decode($argv[1] ?? '', true);
+// Read payload: --stdin reads JSON from stdin, otherwise base64-encoded arg (legacy)
+if (($argv[1] ?? '') === '--stdin') {
+    $raw = stream_get_contents(STDIN);
+} else {
+    $raw = base64_decode($argv[1] ?? '', true);
+}
 if (!$raw) {
-    fwrite(STDERR, "Missing or invalid base64 payload argument.\n");
+    fwrite(STDERR, "Missing or invalid payload.\n");
     exit(1);
 }
 $payload_data = json_decode($raw, true);
