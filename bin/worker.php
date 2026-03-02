@@ -464,6 +464,12 @@ function rescan_all_jobs(callable $schedule_timer): void
     foreach ($sites as $site_id) {
         switch_to_blog($site_id);
 
+        // Flush stale object cache for this site so we read fresh data from DB.
+        // Subprocesses update the DB directly; our in-memory cache won't reflect
+        // those changes (e.g. wp_unschedule_event) without this.
+        wp_cache_delete('cron', 'options');
+        wp_cache_delete('alloptions', 'options');
+
         // Scan WP Cron
         $crons = _get_cron_array();
         if (is_array($crons)) {
