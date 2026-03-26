@@ -6,3 +6,4 @@ composer.lock
 *.pid
 assets/*.min.css
 assets/*.min.js
+.agents/loop-state/
