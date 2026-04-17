@@ -7,3 +7,6 @@ composer.lock
 assets/*.min.css
 assets/*.min.js
 .agents/loop-state/
+
+# AI DevOps local config
+.aidevops.json
