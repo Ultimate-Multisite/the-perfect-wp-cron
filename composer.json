@@ -13,11 +13,22 @@
     "php": ">=8.1"
   },
   "autoload": {
-    "classmap": ["src/"],
-    "exclude-from-classmap": ["src/class-job-list-table.php"]
+    "classmap": [
+      "src/"
+    ],
+    "exclude-from-classmap": [
+      "src/class-job-list-table.php"
+    ]
   },
   "config": {
     "optimize-autoloader": true,
-    "classmap-authoritative": true
+    "classmap-authoritative": true,
+    "allow-plugins": {
+      "phpstan/extension-installer": true
+    }
+  },
+  "require-dev": {
+    "szepeviktor/phpstan-wordpress": "^2.0",
+    "phpstan/extension-installer": "^1.1"
   }
 }
