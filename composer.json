@@ -30,5 +30,10 @@
   "require-dev": {
     "szepeviktor/phpstan-wordpress": "^2.0",
     "phpstan/extension-installer": "^1.1"
+  },
+  "autoload-dev": {
+    "files": [
+      "vendor/php-stubs/wordpress-stubs/wordpress-stubs.php"
+    ]
   }
 }
