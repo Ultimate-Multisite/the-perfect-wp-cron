@@ -62,6 +62,7 @@ $wp_load = Bootstrap::discover_wp_load(__DIR__);
 $socket_path    = Config::socket_path();
 $primary_domain = getenv('DOMAIN_CURRENT_SITE') ?: 'localhost';
 $execute_script = __DIR__ . '/execute-job.php';
+$scan_script    = __DIR__ . '/scan-cron.php';
 
 // --- Clean up stale socket file ---
 if (file_exists($socket_path)) {
@@ -78,7 +79,7 @@ $worker = new Worker('unix://' . $socket_path);
 $worker->count = Config::worker_count();
 $worker->name  = 'the-perfect-wp-cron';
 
-$process = new Worker_Process($wp_load, $primary_domain, $execute_script);
+$process = new Worker_Process($wp_load, $primary_domain, $execute_script, $scan_script);
 
 $worker->onWorkerStart = [$process, 'on_worker_start'];
 $worker->onMessage     = [$process, 'on_message'];

@@ -22,6 +22,9 @@ class Worker_Process
     /** @var string Absolute path to execute-job.php */
     private string $execute_script;
 
+    /** @var string Absolute path to scan-cron.php */
+    private string $scan_script;
+
     // --- Configuration ---
     private int $max_concurrent;
     private int $max_batch_size;
@@ -43,11 +46,12 @@ class Worker_Process
     private int $running_jobs = 0;
     private int $start_time;
 
-    public function __construct(string $wp_load, string $primary_domain, string $execute_script)
+    public function __construct(string $wp_load, string $primary_domain, string $execute_script, string $scan_script = '')
     {
         $this->wp_load        = $wp_load;
         $this->primary_domain = $primary_domain;
         $this->execute_script = $execute_script;
+        $this->scan_script    = $scan_script;
 
         $this->max_concurrent  = Config::max_concurrent();
         $this->max_batch_size  = Config::max_batch_size();
@@ -364,8 +368,14 @@ class Worker_Process
     private function rescan_all_jobs(): void
     {
         $sites = get_sites(['number' => 0, 'fields' => 'ids']);
+        $sovereign_sites = $this->sovereign_site_entries();
 
         foreach ($sites as $site_id) {
+            $site_id = (int) $site_id;
+            if (isset($sovereign_sites[$site_id])) {
+                continue;
+            }
+
             switch_to_blog($site_id);
 
             // Flush stale object cache so we read fresh data from DB.
@@ -418,6 +428,127 @@ class Worker_Process
 
             restore_current_blog();
         }
+
+        foreach ($sovereign_sites as $site_id => $entry) {
+            $this->rescan_sovereign_site_jobs((int) $site_id, $entry);
+        }
+    }
+
+    /**
+     * Load sovereign tenant entries from the generated multi-tenancy registry.
+     *
+     * Sovereign tenants must be scanned in a fresh PHP process bootstrapped with
+     * their own domain. switch_to_blog() in the root worker would target
+     * wp_<blog_id>_* tables inside the tenant DB, but sovereign tenant tables use
+     * the tenant-local wp_ prefix.
+     *
+     * @return array<int, array>
+     */
+    private function sovereign_site_entries(): array
+    {
+        if (!defined('WP_CONTENT_DIR')) {
+            return [];
+        }
+
+        $path = WP_CONTENT_DIR . '/site-registry.data.json';
+        if (!is_readable($path)) {
+            return [];
+        }
+
+        $json = file_get_contents($path);
+        $data = json_decode($json ?: '', true);
+        if (!is_array($data) || empty($data['sites']) || !is_array($data['sites'])) {
+            return [];
+        }
+
+        $entries = [];
+        foreach ($data['sites'] as $site_id => $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+            if (($entry['isolation_model'] ?? '') !== 'sovereign') {
+                continue;
+            }
+            if (($entry['status'] ?? 'active') !== 'active') {
+                continue;
+            }
+            if (empty($entry['domains']) || !is_array($entry['domains'])) {
+                continue;
+            }
+
+            $entries[(int) $site_id] = $entry;
+        }
+
+        return $entries;
+    }
+
+    private function rescan_sovereign_site_jobs(int $site_id, array $entry): void
+    {
+        if ($this->scan_script === '' || !file_exists($this->scan_script)) {
+            Worker::log(sprintf('[RESCAN][SOVEREIGN][ERROR] Missing scan script for site %d', $site_id));
+            return;
+        }
+
+        $site_url = $this->site_url_from_registry_entry($entry);
+        if ($site_url === '') {
+            Worker::log(sprintf('[RESCAN][SOVEREIGN][ERROR] Missing tenant domain for site %d', $site_id));
+            return;
+        }
+
+        $cmd = sprintf('php %s --stdin', escapeshellarg($this->scan_script));
+        $process = proc_open($cmd, [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ], $pipes);
+
+        if (!is_resource($process)) {
+            Worker::log(sprintf('[RESCAN][SOVEREIGN][ERROR] Failed to spawn scan for site %d', $site_id));
+            return;
+        }
+
+        fwrite($pipes[0], json_encode([
+            'site_id'  => $site_id,
+            'site_url' => $site_url,
+        ]));
+        fclose($pipes[0]);
+
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit_code = proc_close($process);
+
+        if ($exit_code !== 0) {
+            $message = trim((string) $stderr);
+            Worker::log(sprintf('[RESCAN][SOVEREIGN][FAIL] Site %d scan failed: %s', $site_id, $message));
+            return;
+        }
+
+        $payloads = json_decode((string) $stdout, true);
+        if (!is_array($payloads)) {
+            Worker::log(sprintf('[RESCAN][SOVEREIGN][FAIL] Site %d scan returned invalid JSON', $site_id));
+            return;
+        }
+
+        foreach ($payloads as $payload_data) {
+            if (!is_array($payload_data)) {
+                continue;
+            }
+            $this->schedule_timer(new Job_Payload($payload_data));
+        }
+    }
+
+    private function site_url_from_registry_entry(array $entry): string
+    {
+        foreach ($entry['domains'] ?? [] as $domain) {
+            $domain = trim((string) $domain);
+            if ($domain !== '') {
+                return 'https://' . $domain . '/';
+            }
+        }
+
+        return '';
     }
 
     /**

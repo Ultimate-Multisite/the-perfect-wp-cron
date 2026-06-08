@@ -16,7 +16,7 @@ class Job_Payload
 
     public function __construct(array $data = [])
     {
-        $this->site_id   = $data['site_id'] ?? get_current_blog_id();
+        $this->site_id   = $data['site_id'] ?? self::current_site_id();
         $this->site_url  = $data['site_url'] ?? get_site_url();
         $this->hook      = $data['hook'] ?? '';
         $this->args      = $data['args'] ?? [];
@@ -60,7 +60,7 @@ class Job_Payload
         }
 
         return new self([
-            'site_id'   => get_current_blog_id(),
+            'site_id'   => self::current_site_id(),
             'site_url'  => get_site_url(),
             'hook'      => $event->hook,
             'args'      => $event->args ?? [],
@@ -88,7 +88,7 @@ class Job_Payload
         $timestamp = $next_date ? $next_date->getTimestamp() : time();
 
         return new self([
-            'site_id'   => get_current_blog_id(),
+            'site_id'   => self::current_site_id(),
             'site_url'  => get_site_url(),
             'hook'      => $action->get_hook(),
             'args'      => $action->get_args(),
@@ -101,12 +101,33 @@ class Job_Payload
     public function tracking_key(): string
     {
         return sprintf(
-            '%s:%d:%s:%s:%d',
+            '%s:%d:%s:%s:%s:%d',
             $this->source,
             $this->site_id,
+            md5($this->site_url),
             $this->hook,
             md5(serialize($this->args)),
             $this->timestamp
         );
+    }
+
+    private static function current_site_id(): int
+    {
+        if (defined('WU_MT_SOVEREIGN_TENANT')) {
+            return (int) WU_MT_SOVEREIGN_TENANT;
+        }
+
+        $host = strtolower(trim((string) ($_SERVER['HTTP_HOST'] ?? '')));
+        if ($host !== '' && defined('WP_CONTENT_DIR')) {
+            $path = WP_CONTENT_DIR . '/site-registry.data.json';
+            if (is_readable($path)) {
+                $data = json_decode((string) file_get_contents($path), true);
+                if (is_array($data) && isset($data['domain_index'][$host])) {
+                    return (int) $data['domain_index'][$host];
+                }
+            }
+        }
+
+        return get_current_blog_id();
     }
 }

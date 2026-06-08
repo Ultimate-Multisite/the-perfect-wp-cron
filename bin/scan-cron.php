@@ -1,18 +1,10 @@
 <?php
 /**
- * Execute one or more jobs in a fresh WordPress environment.
+ * Scan a site's WP-Cron array in a fresh WordPress environment.
  *
- * Spawned by worker.php as a subprocess. Bootstraps WordPress with the correct
- * site domain so all per-site plugins are loaded and DB tables are correct.
- * Accepts a single payload (legacy) or an array of payloads for batch execution.
- *
- * Usage:
- *   php execute-job.php --stdin              (reads JSON from stdin)
- *   php execute-job.php <base64-json>        (legacy)
- *
- * Exit codes:
- *   0 = all jobs succeeded
- *   1 = one or more jobs failed
+ * Used by the long-running worker for sovereign tenants. Those tenants must be
+ * bootstrapped by domain so db-config.php selects the tenant DB and wp_ table
+ * prefix before WordPress loads.
  */
 
 // --- Parse payload from stdin or CLI arg ---
@@ -21,33 +13,24 @@ if (($argv[1] ?? '') === '--stdin') {
 } else {
     $raw = base64_decode($argv[1] ?? '', true);
 }
+
 if (!$raw) {
     fwrite(STDERR, "Missing or invalid payload.\n");
     exit(1);
 }
-$payload_data = json_decode($raw, true);
-if (!is_array($payload_data)) {
+
+$payload = json_decode($raw, true);
+if (!is_array($payload)) {
     fwrite(STDERR, "Invalid JSON payload.\n");
     exit(1);
 }
 
-// Normalize: single payload (has 'hook' key) -> wrap in array
-$payloads = isset($payload_data['hook']) ? [$payload_data] : $payload_data;
-if (empty($payloads)) {
-    fwrite(STDERR, "Empty payload array.\n");
-    exit(1);
-}
-
-$payload = $payloads[0];
-
 // --- Load QueueWorker classes ---
-// 1. Load plugin's own autoloader (classmap with all QueueWorker classes)
 $plugin_autoload = dirname(__DIR__) . '/vendor/autoload.php';
 if (file_exists($plugin_autoload)) {
     require_once $plugin_autoload;
 }
 
-// 2. Walk up from plugin root to find site autoloader (Bedrock: has Dotenv, etc.)
 $site_autoload = null;
 $search = dirname(__DIR__);
 for ($i = 0; $i < 10; $i++) {
@@ -57,6 +40,7 @@ for ($i = 0; $i < 10; $i++) {
         break;
     }
 }
+
 if ($site_autoload) {
     require_once $site_autoload;
 }
@@ -67,18 +51,16 @@ if (!class_exists('QueueWorker\\Config')) {
 }
 
 use QueueWorker\Bootstrap;
-use QueueWorker\Job_Executor;
-use QueueWorker\Job_Log;
+use QueueWorker\Job_Payload;
 
-// --- Discover WordPress and load environment ---
 $site_root = $site_autoload ? dirname($site_autoload, 2) : dirname(__DIR__);
 Bootstrap::load_dotenv($site_root);
 $wp_load = Bootstrap::discover_wp_load(__DIR__);
 
-// --- Bootstrap WordPress with the target site's domain ---
 $domain = parse_url($payload['site_url'] ?? '', PHP_URL_HOST);
 if (!$domain) {
-    $domain = getenv('DOMAIN_CURRENT_SITE') ?: 'localhost';
+    fwrite(STDERR, "Missing site_url host.\n");
+    exit(1);
 }
 
 $_SERVER['HTTP_HOST']      = $domain;
@@ -89,26 +71,52 @@ $_SERVER['HTTPS']          = 'on';
 $_SERVER['REQUEST_METHOD'] = 'GET';
 
 define('QUEUE_WORKER_RUNNING', true);
-if (!defined('DOING_CRON')) {
-    define('DOING_CRON', true);
-}
 
 require_once $wp_load;
 
-// Ensure we're on the correct blog
 $site_id = (int) ($payload['site_id'] ?? get_current_blog_id());
 $is_sovereign_tenant = (defined('WU_MT_SOVEREIGN_TENANT') && (int) WU_MT_SOVEREIGN_TENANT === $site_id)
-    || qw_payload_matches_sovereign_registry($site_id, $domain);
+    || qw_scan_payload_matches_sovereign_registry($site_id, $domain);
 if (!$is_sovereign_tenant && $site_id !== get_current_blog_id()) {
     switch_to_blog($site_id);
 }
 
-Job_Log::ensure_table();
+wp_cache_delete('cron', 'options');
+wp_cache_delete('alloptions', 'options');
 
-// --- Execute jobs ---
-exit((new Job_Executor($site_id))->run($payloads));
+$bypass_hooks = [
+    'wp_version_check',
+    'wp_update_plugins',
+    'wp_update_themes',
+    'action_scheduler_run_queue',
+    'action_scheduler_run_cleanup',
+];
 
-function qw_payload_matches_sovereign_registry(int $site_id, string $domain): bool
+$payloads = [];
+$crons = _get_cron_array();
+if (is_array($crons)) {
+    foreach ($crons as $timestamp => $hooks) {
+        if (!is_array($hooks)) {
+            continue;
+        }
+        foreach ($hooks as $hook => $events) {
+            if (in_array($hook, $bypass_hooks, true)) {
+                continue;
+            }
+            foreach ($events as $event) {
+                $event_obj = (object) array_merge($event, [
+                    'hook'      => $hook,
+                    'timestamp' => $timestamp,
+                ]);
+                $payloads[] = json_decode(Job_Payload::from_cron_event($event_obj)->to_json(), true);
+            }
+        }
+    }
+}
+
+echo json_encode($payloads);
+
+function qw_scan_payload_matches_sovereign_registry(int $site_id, string $domain): bool
 {
     if (!defined('WP_CONTENT_DIR') || $domain === '') {
         return false;
