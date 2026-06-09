@@ -19,6 +19,16 @@ class Config
         return (int) self::get('QUEUE_WORKER_MAX_CONCURRENT', 1);
     }
 
+    public static function action_scheduler_max_concurrent(): int
+    {
+        return (int) self::get('QUEUE_WORKER_AS_MAX_CONCURRENT', 1);
+    }
+
+    public static function action_scheduler_max_batch_size(): int
+    {
+        return (int) self::get('QUEUE_WORKER_AS_MAX_BATCH_SIZE', 10);
+    }
+
     public static function max_batch_size(): int
     {
         return (int) self::get('QUEUE_WORKER_MAX_BATCH_SIZE', 50);

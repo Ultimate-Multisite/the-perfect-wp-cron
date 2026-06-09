@@ -28,6 +28,8 @@ class Worker_Process
     // --- Configuration ---
     private int $max_concurrent;
     private int $max_batch_size;
+    private int $as_max_concurrent;
+    private int $as_max_batch_size;
     private int $batch_timeout;
     private int $rescan_interval;
     private int $memory_limit;
@@ -37,11 +39,14 @@ class Worker_Process
     /** @var array<string, int> tracking_key => timer_id */
     private array $pending_timers = [];
 
-    /** @var list<array{process: resource, pipes: array, payloads: list<Job_Payload>, started: int, stdout: string, stderr: string}> */
+    /** @var list<array{process: resource, pipes: array, payloads: list<Job_Payload>, started: int, stdout: string, stderr: string, lane: string}> */
     private array $running_processes = [];
 
     /** @var array<int, list<Job_Payload>> site_id => [payload, ...] */
     private array $pending_batch = [];
+
+    /** @var array<int, list<Job_Payload>> site_id => [payload, ...] */
+    private array $pending_as_batch = [];
 
     private int $running_jobs = 0;
     private int $start_time;
@@ -55,6 +60,8 @@ class Worker_Process
 
         $this->max_concurrent  = Config::max_concurrent();
         $this->max_batch_size  = Config::max_batch_size();
+        $this->as_max_concurrent = Config::action_scheduler_max_concurrent();
+        $this->as_max_batch_size = Config::action_scheduler_max_batch_size();
         $this->batch_timeout   = Config::batch_timeout();
         $this->rescan_interval = Config::rescan_interval();
         $this->memory_limit    = Config::memory_limit();
@@ -84,7 +91,8 @@ class Worker_Process
             Job_Log::ensure_table();
         }
 
-        // Batch flush timer — every 1 second
+        // Batch flush timer — every 1 second. Action Scheduler gets its own
+        // lane so due AS jobs are not starved behind noisy WP-Cron batches.
         Timer::add(1, fn() => $this->flush_batches());
 
         // Subprocess polling timer — every 0.5 seconds
@@ -172,6 +180,11 @@ class Worker_Process
         $key = $payload->tracking_key();
         unset($this->pending_timers[$key]);
 
+        if ($payload->source === 'action_scheduler') {
+            $this->execute_action_scheduler_job($payload);
+            return;
+        }
+
         // Check concurrency limit before claiming
         if (count($this->running_processes) >= $this->max_concurrent) {
             // Re-schedule with 2s delay
@@ -191,9 +204,35 @@ class Worker_Process
     }
 
     /**
+     * Fired by timer when an Action Scheduler job is due.
+     *
+     * Action Scheduler gets a dedicated lane instead of sharing the normal
+     * WP-Cron concurrency budget. This preserves exact scheduling for urgent
+     * AS work (checkout pending-site publish, domain stages, billing jobs)
+     * even when the worker is draining many recurring cron events.
+     */
+    private function execute_action_scheduler_job(Job_Payload $payload): void
+    {
+        $key = $payload->tracking_key();
+
+        if ($this->running_process_count('action_scheduler') >= $this->as_max_concurrent) {
+            $timer_id = Timer::add(1, fn($p) => $this->execute_action_scheduler_job($p), [$payload], false);
+            $this->pending_timers[$key] = $timer_id;
+            return;
+        }
+
+        $lock_key = 'qw_' . substr(md5($key), 0, 40);
+        if (!$this->claim_job($lock_key)) {
+            return;
+        }
+
+        $this->pending_as_batch[$payload->site_id][] = $payload;
+    }
+
+    /**
      * Spawn a subprocess to execute a batch of jobs (all same site).
      */
-    private function spawn_batch(array $payloads, int $worker_id): void
+    private function spawn_batch(array $payloads, int $worker_id, string $lane = 'wp_cron'): void
     {
         $json_array = array_map(
             fn($p) => json_decode($p->to_json(), true),
@@ -232,12 +271,14 @@ class Worker_Process
             'started'  => time(),
             'stdout'   => '',
             'stderr'   => '',
+            'lane'     => $lane,
         ];
 
         $hooks = array_map(fn($p) => $p->hook, $payloads);
         Worker::log(sprintf(
-            '[W%d][SPAWN] Batch: %d jobs on site %d (pid %d, %d running): %s',
+            '[W%d][SPAWN][%s] Batch: %d jobs on site %d (pid %d, %d running): %s',
             $worker_id,
+            $lane,
             count($payloads),
             $payloads[0]->site_id,
             proc_get_status($process)['pid'] ?? 0,
@@ -251,6 +292,8 @@ class Worker_Process
      */
     private function flush_batches(): void
     {
+        $this->flush_action_scheduler_batches();
+
         foreach ($this->pending_batch as $site_id => $payloads) {
             if (empty($payloads)) {
                 unset($this->pending_batch[$site_id]);
@@ -266,6 +309,38 @@ class Worker_Process
                 unset($this->pending_batch[$site_id]);
             }
         }
+    }
+
+    /**
+     * Flush pending Action Scheduler batches before normal WP-Cron batches.
+     */
+    private function flush_action_scheduler_batches(): void
+    {
+        foreach ($this->pending_as_batch as $site_id => $payloads) {
+            if (empty($payloads)) {
+                unset($this->pending_as_batch[$site_id]);
+                continue;
+            }
+            if ($this->running_process_count('action_scheduler') >= $this->as_max_concurrent) {
+                break;
+            }
+            $batch = array_splice($this->pending_as_batch[$site_id], 0, $this->as_max_batch_size);
+            $this->spawn_batch($batch, 0, 'action_scheduler');
+            if (empty($this->pending_as_batch[$site_id])) {
+                unset($this->pending_as_batch[$site_id]);
+            }
+        }
+    }
+
+    private function running_process_count(string $lane): int
+    {
+        $count = 0;
+        foreach ($this->running_processes as $proc) {
+            if (($proc['lane'] ?? 'wp_cron') === $lane) {
+                $count++;
+            }
+        }
+        return $count;
     }
 
     /**
@@ -370,6 +445,15 @@ class Worker_Process
         $sites = get_sites(['number' => 0, 'fields' => 'ids']);
         $sovereign_sites = $this->sovereign_site_entries();
 
+        $current_blog_id = get_current_blog_id();
+
+        // Action Scheduler stores its tables at the network/base prefix in
+        // this multisite. Scanning it while switched to sovereign subsites
+        // makes Action Scheduler look for missing per-site AS tables and also
+        // schedules duplicate timers with different site IDs. Scan AS once in
+        // the current/root context, then scan WP-Cron per site below.
+        $this->rescan_action_scheduler_jobs();
+
         foreach ($sites as $site_id) {
             $site_id = (int) $site_id;
             if (isset($sovereign_sites[$site_id])) {
@@ -411,26 +495,15 @@ class Worker_Process
                     }
                 }
             }
-
-            // Scan Action Scheduler
-            if (function_exists('as_get_scheduled_actions')) {
-                $actions = as_get_scheduled_actions([
-                    'status'   => \ActionScheduler_Store::STATUS_PENDING,
-                    'per_page' => 500,
-                ]);
-                foreach ($actions as $action_id => $action) {
-                    $payload = Job_Payload::from_as_action($action_id);
-                    if ($payload) {
-                        $this->schedule_timer($payload);
-                    }
-                }
-            }
-
             restore_current_blog();
         }
 
         foreach ($sovereign_sites as $site_id => $entry) {
             $this->rescan_sovereign_site_jobs((int) $site_id, $entry);
+        }
+
+        if ($current_blog_id !== get_current_blog_id()) {
+            switch_to_blog($current_blog_id);
         }
     }
 
@@ -551,6 +624,24 @@ class Worker_Process
         return '';
     }
 
+    private function rescan_action_scheduler_jobs(): void
+    {
+        if (!function_exists('as_get_scheduled_actions')) {
+            return;
+        }
+
+        $actions = as_get_scheduled_actions([
+            'status'   => \ActionScheduler_Store::STATUS_PENDING,
+            'per_page' => 500,
+        ]);
+        foreach ($actions as $action_id => $action) {
+            $payload = Job_Payload::from_as_action($action_id);
+            if ($payload) {
+                $this->schedule_timer($payload);
+            }
+        }
+    }
+
     /**
      * Atomically claim a job via INSERT IGNORE into the lock table.
      */
@@ -599,6 +690,7 @@ class Worker_Process
                         'site_id' => $site_id,
                         'count'   => $count,
                         'elapsed' => time() - $proc['started'],
+                        'lane'    => $proc['lane'] ?? 'wp_cron',
                     ];
                 }
 
@@ -607,7 +699,9 @@ class Worker_Process
                     'uptime'          => sprintf('%dh %dm %ds', $hours, $mins, $secs),
                     'uptime_seconds'  => $uptime,
                     'pending_timers'  => count($this->pending_timers),
+                    'pending_as_batches' => array_sum(array_map('count', $this->pending_as_batch)),
                     'running_jobs'    => $this->running_jobs,
+                    'running_as_jobs' => $this->running_process_count('action_scheduler'),
                     'memory'          => sprintf('%.1f MB', $mem_mb),
                     'running_details' => $running_details,
                 ]);
