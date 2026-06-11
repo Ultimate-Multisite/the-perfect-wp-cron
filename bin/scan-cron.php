@@ -114,7 +114,39 @@ if (is_array($crons)) {
     }
 }
 
+if (function_exists('as_get_scheduled_actions') && qw_scan_action_scheduler_tables_exist()) {
+    try {
+        $actions = as_get_scheduled_actions([
+            'status'   => \ActionScheduler_Store::STATUS_PENDING,
+            'per_page' => 500,
+        ]);
+        foreach ($actions as $action_id => $action) {
+            $action_payload = Job_Payload::from_as_action($action_id);
+            if ($action_payload) {
+                $payloads[] = json_decode($action_payload->to_json(), true);
+            }
+        }
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Action Scheduler scan failed: " . $e->getMessage() . "\n");
+    }
+}
+
 echo json_encode($payloads);
+
+function qw_scan_action_scheduler_tables_exist(): bool
+{
+    global $wpdb;
+
+    foreach (['actions', 'groups'] as $suffix) {
+        $table = $wpdb->prefix . 'actionscheduler_' . $suffix;
+        $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+        if ($found !== $table) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 function qw_scan_payload_matches_sovereign_registry(int $site_id, string $domain): bool
 {
