@@ -71,6 +71,23 @@ class CLI_Commands
         foreach ($sites as $site_id) {
             switch_to_blog($site_id);
 
+            // Scan Action Scheduler pending actions only when this switched
+            // site has its own scheduler tables. Some multisite blogs have no
+            // per-site Action Scheduler tables, and probing them directly
+            // emits database errors.
+            if (function_exists('as_get_scheduled_actions') && $this->action_scheduler_tables_exist()) {
+                $actions = as_get_scheduled_actions([
+                    'status'   => \ActionScheduler_Store::STATUS_PENDING,
+                    'per_page' => 500,
+                ]);
+                foreach ($actions as $action_id => $action) {
+                    $payload = Job_Payload::from_as_action($action_id);
+                    if ($payload && Socket_Client::notify($payload)) {
+                        $count++;
+                    }
+                }
+            }
+
             $crons = _get_cron_array();
             if (is_array($crons)) {
                 foreach ($crons as $timestamp => $hooks) {
@@ -89,24 +106,25 @@ class CLI_Commands
                 }
             }
 
-            // Scan Action Scheduler pending actions
-            if (function_exists('as_get_scheduled_actions')) {
-                $actions = as_get_scheduled_actions([
-                    'status'   => \ActionScheduler_Store::STATUS_PENDING,
-                    'per_page' => 500,
-                ]);
-                foreach ($actions as $action_id => $action) {
-                    $payload = Job_Payload::from_as_action($action_id);
-                    if ($payload && Socket_Client::notify($payload)) {
-                        $count++;
-                    }
-                }
-            }
-
             restore_current_blog();
         }
 
         WP_CLI::success("Sent $count jobs to the queue worker.");
+    }
+
+    private function action_scheduler_tables_exist(): bool
+    {
+        global $wpdb;
+
+        foreach (['actions', 'groups'] as $suffix) {
+            $table = $wpdb->prefix . 'actionscheduler_' . $suffix;
+            $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+            if ($found !== $table) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

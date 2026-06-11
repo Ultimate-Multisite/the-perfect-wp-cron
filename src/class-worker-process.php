@@ -447,13 +447,6 @@ class Worker_Process
 
         $current_blog_id = get_current_blog_id();
 
-        // Action Scheduler stores its tables at the network/base prefix in
-        // this multisite. Scanning it while switched to sovereign subsites
-        // makes Action Scheduler look for missing per-site AS tables and also
-        // schedules duplicate timers with different site IDs. Scan AS once in
-        // the current/root context, then scan WP-Cron per site below.
-        $this->rescan_action_scheduler_jobs();
-
         foreach ($sites as $site_id) {
             $site_id = (int) $site_id;
             if (isset($sovereign_sites[$site_id])) {
@@ -465,6 +458,12 @@ class Worker_Process
             // Flush stale object cache so we read fresh data from DB.
             wp_cache_delete('cron', 'options');
             wp_cache_delete('alloptions', 'options');
+
+            // Action Scheduler can store actions in either the root tables or
+            // per-site tables. Only scan the currently switched site when its
+            // Action Scheduler tables exist so missing legacy tables do not
+            // produce noisy database errors or duplicate root-site timers.
+            $this->rescan_action_scheduler_jobs();
 
             // Scan WP Cron
             $crons = _get_cron_array();
@@ -630,16 +629,45 @@ class Worker_Process
             return;
         }
 
-        $actions = as_get_scheduled_actions([
-            'status'   => \ActionScheduler_Store::STATUS_PENDING,
-            'per_page' => 500,
-        ]);
+        if (!$this->action_scheduler_tables_exist()) {
+            return;
+        }
+
+        try {
+            $actions = as_get_scheduled_actions([
+                'status'   => \ActionScheduler_Store::STATUS_PENDING,
+                'per_page' => 500,
+            ]);
+        } catch (\Throwable $e) {
+            Worker::log(sprintf(
+                '[RESCAN][ACTION_SCHEDULER][FAIL] Site %d scan failed: %s',
+                get_current_blog_id(),
+                $e->getMessage()
+            ));
+            return;
+        }
+
         foreach ($actions as $action_id => $action) {
             $payload = Job_Payload::from_as_action($action_id);
             if ($payload) {
                 $this->schedule_timer($payload);
             }
         }
+    }
+
+    private function action_scheduler_tables_exist(): bool
+    {
+        global $wpdb;
+
+        foreach (['actions', 'groups'] as $suffix) {
+            $table = $wpdb->prefix . 'actionscheduler_' . $suffix;
+            $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+            if ($found !== $table) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
