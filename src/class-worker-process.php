@@ -30,6 +30,8 @@ class Worker_Process
     private int $max_batch_size;
     private int $as_max_concurrent;
     private int $as_max_batch_size;
+    private array $as_lanes;
+    private int $as_rescan_interval;
     private int $batch_timeout;
     private int $rescan_interval;
     private int $memory_limit;
@@ -45,7 +47,7 @@ class Worker_Process
     /** @var array<int, list<Job_Payload>> site_id => [payload, ...] */
     private array $pending_batch = [];
 
-    /** @var array<int, list<Job_Payload>> site_id => [payload, ...] */
+    /** @var array<string, array<int, list<Job_Payload>>> lane => site_id => [payload, ...] */
     private array $pending_as_batch = [];
 
     private int $running_jobs = 0;
@@ -62,6 +64,8 @@ class Worker_Process
         $this->max_batch_size  = Config::max_batch_size();
         $this->as_max_concurrent = Config::action_scheduler_max_concurrent();
         $this->as_max_batch_size = Config::action_scheduler_max_batch_size();
+        $this->as_lanes       = Config::action_scheduler_lanes();
+        $this->as_rescan_interval = Config::action_scheduler_rescan_interval();
         $this->batch_timeout   = Config::batch_timeout();
         $this->rescan_interval = Config::rescan_interval();
         $this->memory_limit    = Config::memory_limit();
@@ -108,6 +112,16 @@ class Worker_Process
             Worker::log(sprintf('[W%d][RESCAN] %d timers pending, rescanning...', $worker_id, count($this->pending_timers)));
             $this->rescan_all_jobs();
         });
+
+        // Action Scheduler can miss instant socket notification when an action
+        // is enqueued before its integration hook is registered in a request.
+        // Keep a short AS-only safety scan in the current/root context; the
+        // full multisite rescan still covers per-site and sovereign tables.
+        Timer::add($this->as_rescan_interval, function () use ($worker_id) {
+            Worker::log(sprintf('[W%d][AS_RESCAN] scanning pending Action Scheduler jobs...', $worker_id));
+            $this->rescan_action_scheduler_jobs();
+        });
+
         $stagger = $worker_id * 5;
         if ($stagger > 0) {
             Timer::add($stagger, function () {}, null, false);
@@ -215,7 +229,8 @@ class Worker_Process
     {
         $key = $payload->tracking_key();
 
-        if ($this->running_process_count('action_scheduler') >= $this->as_max_concurrent) {
+        $lane = $this->action_scheduler_lane_for($payload);
+        if ($this->running_process_count($lane) >= $this->lane_max_concurrent($lane)) {
             $timer_id = Timer::add(1, fn($p) => $this->execute_action_scheduler_job($p), [$payload], false);
             $this->pending_timers[$key] = $timer_id;
             return;
@@ -226,7 +241,7 @@ class Worker_Process
             return;
         }
 
-        $this->pending_as_batch[$payload->site_id][] = $payload;
+        $this->pending_as_batch[$lane][$payload->site_id][] = $payload;
     }
 
     /**
@@ -316,20 +331,76 @@ class Worker_Process
      */
     private function flush_action_scheduler_batches(): void
     {
-        foreach ($this->pending_as_batch as $site_id => $payloads) {
-            if (empty($payloads)) {
-                unset($this->pending_as_batch[$site_id]);
-                continue;
+        foreach ($this->pending_as_batch as $lane => $site_batches) {
+            foreach ($site_batches as $site_id => $payloads) {
+                if (empty($payloads)) {
+                    unset($this->pending_as_batch[$lane][$site_id]);
+                    continue;
+                }
+                if ($this->running_process_count($lane) >= $this->lane_max_concurrent($lane)) {
+                    break;
+                }
+                $batch = array_splice($this->pending_as_batch[$lane][$site_id], 0, $this->lane_max_batch_size($lane));
+                $this->spawn_batch($batch, 0, $lane);
+                if (empty($this->pending_as_batch[$lane][$site_id])) {
+                    unset($this->pending_as_batch[$lane][$site_id]);
+                }
             }
-            if ($this->running_process_count('action_scheduler') >= $this->as_max_concurrent) {
-                break;
-            }
-            $batch = array_splice($this->pending_as_batch[$site_id], 0, $this->as_max_batch_size);
-            $this->spawn_batch($batch, 0, 'action_scheduler');
-            if (empty($this->pending_as_batch[$site_id])) {
-                unset($this->pending_as_batch[$site_id]);
+
+            if (empty($this->pending_as_batch[$lane])) {
+                unset($this->pending_as_batch[$lane]);
             }
         }
+    }
+
+    private function action_scheduler_lane_for(Job_Payload $payload): string
+    {
+        foreach ($this->as_lanes as $lane) {
+            if (!$this->lane_matches($lane, $payload)) {
+                continue;
+            }
+
+            return $lane['name'];
+        }
+
+        return 'action_scheduler';
+    }
+
+    private function lane_matches(array $lane, Job_Payload $payload): bool
+    {
+        if (!empty($lane['sites']) && !in_array($payload->site_id, $lane['sites'], true)) {
+            return false;
+        }
+        if (!empty($lane['groups']) && !in_array($payload->group, $lane['groups'], true)) {
+            return false;
+        }
+        if (!empty($lane['hooks']) && !in_array($payload->hook, $lane['hooks'], true)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private function lane_max_concurrent(string $lane_name): int
+    {
+        foreach ($this->as_lanes as $lane) {
+            if ($lane['name'] === $lane_name) {
+                return (int) $lane['max_concurrent'];
+            }
+        }
+
+        return $this->as_max_concurrent;
+    }
+
+    private function lane_max_batch_size(string $lane_name): int
+    {
+        foreach ($this->as_lanes as $lane) {
+            if ($lane['name'] === $lane_name) {
+                return (int) $lane['max_batch_size'];
+            }
+        }
+
+        return $this->as_max_batch_size;
     }
 
     private function running_process_count(string $lane): int
@@ -468,6 +539,7 @@ class Worker_Process
             // Scan WP Cron
             $crons = _get_cron_array();
             if (is_array($crons)) {
+                $seen_cron_signatures = [];
                 foreach ($crons as $timestamp => $hooks) {
                     if (!is_array($hooks)) {
                         continue;
@@ -484,6 +556,12 @@ class Worker_Process
                         }
 
                         foreach ($events as $event) {
+                            $signature = $this->cron_event_signature($hook, $event, (int) $timestamp);
+                            if (isset($seen_cron_signatures[$signature])) {
+                                continue;
+                            }
+                            $seen_cron_signatures[$signature] = true;
+
                             $event_obj = (object) array_merge($event, [
                                 'hook'      => $hook,
                                 'timestamp' => $timestamp,
@@ -727,9 +805,11 @@ class Worker_Process
                     'uptime'          => sprintf('%dh %dm %ds', $hours, $mins, $secs),
                     'uptime_seconds'  => $uptime,
                     'pending_timers'  => count($this->pending_timers),
-                    'pending_as_batches' => array_sum(array_map('count', $this->pending_as_batch)),
+                    'pending_as_batches' => $this->pending_action_scheduler_count(),
                     'running_jobs'    => $this->running_jobs,
-                    'running_as_jobs' => $this->running_process_count('action_scheduler'),
+                    'running_as_jobs' => $this->running_action_scheduler_count(),
+                    'running_as_lanes' => $this->running_action_scheduler_counts(),
+                    'pending_as_lanes' => $this->pending_action_scheduler_counts(),
                     'memory'          => sprintf('%.1f MB', $mem_mb),
                     'running_details' => $running_details,
                 ]);
@@ -746,6 +826,53 @@ class Worker_Process
                 $connection->close();
                 break;
         }
+    }
+
+    private function pending_action_scheduler_count(): int
+    {
+        return array_sum($this->pending_action_scheduler_counts());
+    }
+
+    private function pending_action_scheduler_counts(): array
+    {
+        $counts = [];
+        foreach ($this->pending_as_batch as $lane => $site_batches) {
+            $counts[$lane] = array_sum(array_map('count', $site_batches));
+        }
+
+        return $counts;
+    }
+
+    private function running_action_scheduler_counts(): array
+    {
+        $counts = [];
+        foreach ($this->running_processes as $proc) {
+            $lane = $proc['lane'] ?? 'wp_cron';
+            if ($lane === 'wp_cron') {
+                continue;
+            }
+            $counts[$lane] = ($counts[$lane] ?? 0) + 1;
+        }
+
+        return $counts;
+    }
+
+    private function running_action_scheduler_count(): int
+    {
+        return array_sum($this->running_action_scheduler_counts());
+    }
+
+    private function cron_event_signature(string $hook, array $event, int $timestamp): string
+    {
+        $event_timestamp = empty($event['schedule']) ? $timestamp : 0;
+
+        return sprintf(
+            '%s:%s:%d:%s',
+            $hook,
+            $event['schedule'] ?? '',
+            $event_timestamp,
+            md5(serialize($event['args'] ?? []))
+        );
     }
 
     /**

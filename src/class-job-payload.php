@@ -13,6 +13,7 @@ class Job_Payload
     public int $interval;
     public string $source; // 'wp_cron' | 'action_scheduler'
     public int $action_id;
+    public string $group;
 
     public function __construct(array $data = [])
     {
@@ -25,6 +26,7 @@ class Job_Payload
         $this->interval  = $data['interval'] ?? 0;
         $this->source    = $data['source'] ?? 'wp_cron';
         $this->action_id = $data['action_id'] ?? 0;
+        $this->group     = $data['group'] ?? '';
     }
 
     public function to_json(): string
@@ -39,6 +41,7 @@ class Job_Payload
             'interval'  => $this->interval,
             'source'    => $this->source,
             'action_id' => $this->action_id,
+            'group'     => $this->group,
         ]);
     }
 
@@ -68,6 +71,7 @@ class Job_Payload
             'schedule'  => $event->schedule ?? '',
             'interval'  => $interval,
             'source'    => 'wp_cron',
+            'group'     => '',
         ]);
     }
 
@@ -95,17 +99,19 @@ class Job_Payload
             'timestamp' => $timestamp,
             'source'    => 'action_scheduler',
             'action_id' => $action_id,
+            'group'     => method_exists($action, 'get_group') ? $action->get_group() : '',
         ]);
     }
 
     public function tracking_key(): string
     {
         return sprintf(
-            '%s:%d:%s:%s:%s:%d',
+            '%s:%d:%s:%s:%s:%s:%d',
             $this->source,
             $this->site_id,
             md5($this->site_url),
             $this->hook,
+            $this->group,
             md5(serialize($this->args)),
             $this->timestamp
         );

@@ -95,6 +95,7 @@ $bypass_hooks = [
 $payloads = [];
 $crons = _get_cron_array();
 if (is_array($crons)) {
+    $seen_cron_signatures = [];
     foreach ($crons as $timestamp => $hooks) {
         if (!is_array($hooks)) {
             continue;
@@ -104,6 +105,12 @@ if (is_array($crons)) {
                 continue;
             }
             foreach ($events as $event) {
+                $signature = qw_scan_cron_event_signature($hook, $event, (int) $timestamp);
+                if (isset($seen_cron_signatures[$signature])) {
+                    continue;
+                }
+                $seen_cron_signatures[$signature] = true;
+
                 $event_obj = (object) array_merge($event, [
                     'hook'      => $hook,
                     'timestamp' => $timestamp,
@@ -146,6 +153,19 @@ function qw_scan_action_scheduler_tables_exist(): bool
     }
 
     return true;
+}
+
+function qw_scan_cron_event_signature(string $hook, array $event, int $timestamp): string
+{
+    $event_timestamp = empty($event['schedule']) ? $timestamp : 0;
+
+    return sprintf(
+        '%s:%s:%d:%s',
+        $hook,
+        $event['schedule'] ?? '',
+        $event_timestamp,
+        md5(serialize($event['args'] ?? []))
+    );
 }
 
 function qw_scan_payload_matches_sovereign_registry(int $site_id, string $domain): bool
