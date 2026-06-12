@@ -214,6 +214,191 @@ class CLI_Commands
     }
 
     /**
+     * Report or remove duplicate persisted WP-Cron events.
+     *
+     * Duplicate recurring events can accumulate when long-running event-loop
+     * execution, wp_reschedule_event(), backlog catch-up, and plugin bootstrap
+     * scheduling all touch the same hook. This command groups events by site,
+     * hook, schedule, and args; keeps the earliest timestamp; and optionally
+     * removes later timestamps for identical recurring/event signatures.
+     *
+     * ## OPTIONS
+     *
+     * --dry-run
+     * : Report duplicate groups without modifying cron options.
+     *
+     * --apply
+     * : Remove later duplicate events with wp_unschedule_event().
+     *
+     * ## EXAMPLES
+     *
+     *     wp queue dedupe-cron --dry-run
+     *     wp queue dedupe-cron --apply
+     *
+     * @subcommand dedupe-cron
+     */
+    public function dedupe_cron($args, $assoc_args): void
+    {
+        $dry_run = (bool) ($assoc_args['dry-run'] ?? false);
+        $apply   = (bool) ($assoc_args['apply'] ?? false);
+
+        if ($dry_run === $apply) {
+            WP_CLI::error('Specify exactly one of --dry-run or --apply.');
+        }
+
+        $totals = [
+            'sites'    => 0,
+            'groups'   => 0,
+            'retained' => 0,
+            'removed'  => 0,
+        ];
+        $rows = [];
+
+        foreach ($this->cron_dedupe_site_ids() as $site_id) {
+            $site_id = (int) $site_id;
+            $totals['sites']++;
+
+            if (is_multisite()) {
+                switch_to_blog($site_id);
+            }
+
+            try {
+                $report = $this->cron_dedupe_site_report($site_id, $apply);
+            } finally {
+                if (is_multisite()) {
+                    restore_current_blog();
+                }
+            }
+
+            $totals['groups']   += $report['groups'];
+            $totals['retained'] += $report['retained'];
+            $totals['removed']  += $report['removed'];
+            $rows = array_merge($rows, $report['rows']);
+        }
+
+        WP_CLI::log($apply ? 'Duplicate WP-Cron cleanup applied.' : 'Duplicate WP-Cron dry-run report. No changes were made.');
+        WP_CLI::log('Grouping key: site_id + hook + schedule + args; earliest timestamp retained.');
+
+        if (!empty($rows)) {
+            \WP_CLI\Utils\format_items('table', $rows, ['site_id', 'hook', 'schedule', 'duplicates', 'retained_timestamp', 'removed_timestamps']);
+        } else {
+            WP_CLI::log('No duplicate WP-Cron events found.');
+        }
+
+        WP_CLI::log(sprintf('Sites scanned: %d', $totals['sites']));
+        WP_CLI::log(sprintf('Duplicate groups: %d', $totals['groups']));
+        WP_CLI::log(sprintf('Retained events: %d', $totals['retained']));
+        WP_CLI::log(sprintf('%s events: %d', $apply ? 'Removed' : 'Would remove', $totals['removed']));
+
+        WP_CLI::success($apply ? 'Cron dedupe complete.' : 'Cron dedupe dry-run complete.');
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function cron_dedupe_site_ids(): array
+    {
+        if (!is_multisite()) {
+            return [get_current_blog_id()];
+        }
+
+        return array_map('intval', get_sites(['number' => 0, 'fields' => 'ids']));
+    }
+
+    /**
+     * @return array{groups: int, retained: int, removed: int, rows: list<array<string, int|string>>}
+     */
+    private function cron_dedupe_site_report(int $site_id, bool $apply): array
+    {
+        $crons = _get_cron_array();
+        if (!is_array($crons)) {
+            return ['groups' => 0, 'retained' => 0, 'removed' => 0, 'rows' => []];
+        }
+
+        $groups = $this->cron_duplicate_groups($crons);
+        $report = ['groups' => 0, 'retained' => 0, 'removed' => 0, 'rows' => []];
+
+        foreach ($groups as $group) {
+            if (count($group['events']) < 2) {
+                continue;
+            }
+
+            $duplicates = array_slice($group['events'], 1);
+            $removed_timestamps = [];
+
+            foreach ($duplicates as $event) {
+                $removed_timestamps[] = (int) $event['timestamp'];
+
+                if ($apply) {
+                    wp_unschedule_event((int) $event['timestamp'], $group['hook'], $group['args']);
+                }
+            }
+
+            $duplicate_count = count($duplicates);
+            $report['groups']++;
+            $report['retained']++;
+            $report['removed'] += $duplicate_count;
+            $report['rows'][] = [
+                'site_id'            => $site_id,
+                'hook'               => $group['hook'],
+                'schedule'           => $group['schedule'] !== '' ? $group['schedule'] : '(one-shot)',
+                'duplicates'         => $duplicate_count,
+                'retained_timestamp' => (int) $group['events'][0]['timestamp'],
+                'removed_timestamps' => implode(',', array_map('strval', $removed_timestamps)),
+            ];
+        }
+
+        return $report;
+    }
+
+    /**
+     * @return array<string, array{hook: string, schedule: string, args: array, events: list<array{timestamp: int}>}>
+     */
+    private function cron_duplicate_groups(array $crons): array
+    {
+        $groups = [];
+
+        foreach ($crons as $timestamp => $hooks) {
+            if (!is_array($hooks)) {
+                continue;
+            }
+
+            foreach ($hooks as $hook => $events) {
+                if (!is_array($events)) {
+                    continue;
+                }
+
+                foreach ($events as $event) {
+                    if (!is_array($event)) {
+                        continue;
+                    }
+
+                    $signature = Cron_Event_Filter::signature((string) $hook, $event, (int) $timestamp);
+                    if (!isset($groups[$signature])) {
+                        $groups[$signature] = [
+                            'hook'     => (string) $hook,
+                            'schedule' => (string) ($event['schedule'] ?? ''),
+                            'args'     => $event['args'] ?? [],
+                            'events'   => [],
+                        ];
+                    }
+
+                    $groups[$signature]['events'][] = ['timestamp' => (int) $timestamp];
+                }
+            }
+        }
+
+        foreach ($groups as $signature => $group) {
+            usort($group['events'], static function (array $left, array $right): int {
+                return $left['timestamp'] <=> $right['timestamp'];
+            });
+            $groups[$signature] = $group;
+        }
+
+        return $groups;
+    }
+
+    /**
      * Report pending, overdue, and failed Action Scheduler actions by hook/group.
      *
      * ## OPTIONS
