@@ -28,6 +28,9 @@ class Worker_Process
     // --- Configuration ---
     private int $max_concurrent;
     private int $max_batch_size;
+    private int $cron_max_concurrent;
+    private int $cron_max_batch_size;
+    private array $cron_lanes;
     private int $as_max_concurrent;
     private int $as_max_batch_size;
     private array $as_lanes;
@@ -49,7 +52,7 @@ class Worker_Process
     /** @var list<array{process: resource, pipes: array, payloads: list<Job_Payload>, started: int, stdout: string, stderr: string, lane: string}> */
     private array $running_processes = [];
 
-    /** @var array<int, list<Job_Payload>> site_id => [payload, ...] */
+    /** @var array<string, array<int, list<Job_Payload>>> lane => site_id => [payload, ...] */
     private array $pending_batch = [];
 
     /** @var array<string, array<int, list<Job_Payload>>> lane => site_id => [payload, ...] */
@@ -71,6 +74,9 @@ class Worker_Process
 
         $this->max_concurrent  = Config::max_concurrent();
         $this->max_batch_size  = Config::max_batch_size();
+        $this->cron_max_concurrent = Config::cron_max_concurrent();
+        $this->cron_max_batch_size = Config::cron_max_batch_size();
+        $this->cron_lanes      = Config::cron_lanes();
         $this->as_max_concurrent = Config::action_scheduler_max_concurrent();
         $this->as_max_batch_size = Config::action_scheduler_max_batch_size();
         $this->as_lanes       = Config::action_scheduler_lanes();
@@ -223,8 +229,8 @@ class Worker_Process
             return;
         }
 
-        // Check concurrency limit before claiming
-        if (count($this->running_processes) >= $this->max_concurrent) {
+        $lane = $this->cron_lane_for($payload);
+        if ($this->running_process_count($lane) >= $this->cron_lane_max_concurrent($lane)) {
             // Re-schedule with 2s delay
             $timer_id = Timer::add(2, fn($p) => $this->execute_job($p), [$payload], false);
             $this->pending_timers[$key] = $timer_id;
@@ -239,7 +245,8 @@ class Worker_Process
         }
 
         // Collect into pending batch — flushed by the batch timer
-        $this->pending_batch[$payload->site_id][] = $payload;
+        $payload->lane = $lane;
+        $this->pending_batch[$lane][$payload->site_id][] = $payload;
     }
 
     /**
@@ -337,23 +344,65 @@ class Worker_Process
     {
         $this->flush_action_scheduler_batches();
 
-        foreach ($this->ordered_site_ids_by_priority($this->pending_batch) as $site_id) {
-            $payloads = $this->pending_batch[$site_id] ?? [];
-            if (empty($payloads)) {
-                unset($this->pending_batch[$site_id]);
-                continue;
+        foreach ($this->ordered_cron_lanes() as $lane) {
+            foreach ($this->ordered_site_ids_by_priority($this->pending_batch[$lane]) as $site_id) {
+                $payloads = $this->pending_batch[$lane][$site_id] ?? [];
+                if (empty($payloads)) {
+                    unset($this->pending_batch[$lane][$site_id]);
+                    continue;
+                }
+                if ($this->running_process_count($lane) >= $this->cron_lane_max_concurrent($lane)) {
+                    break;
+                }
+                $this->sort_payloads_by_priority($this->pending_batch[$lane][$site_id]);
+                $batch = array_splice($this->pending_batch[$lane][$site_id], 0, $this->cron_lane_max_batch_size($lane));
+                // Worker ID isn't critical for batch flush logging; use 0
+                $this->spawn_batch($batch, 0, $lane);
+                if (empty($this->pending_batch[$lane][$site_id])) {
+                    unset($this->pending_batch[$lane][$site_id]);
+                }
             }
-            if (count($this->running_processes) >= $this->max_concurrent) {
-                break;
-            }
-            $this->sort_payloads_by_priority($this->pending_batch[$site_id]);
-            $batch = array_splice($this->pending_batch[$site_id], 0, $this->max_batch_size);
-            // Worker ID isn't critical for batch flush logging; use 0
-            $this->spawn_batch($batch, 0);
-            if (empty($this->pending_batch[$site_id])) {
-                unset($this->pending_batch[$site_id]);
+
+            if (empty($this->pending_batch[$lane])) {
+                unset($this->pending_batch[$lane]);
             }
         }
+    }
+
+    private function ordered_cron_lanes(): array
+    {
+        $ordered = [];
+        foreach ($this->cron_lanes as $lane) {
+            $name = $lane['name'] ?? '';
+            if ($name !== '' && isset($this->pending_batch[$name])) {
+                $ordered[] = $name;
+            }
+        }
+
+        if (isset($this->pending_batch['wp_cron'])) {
+            $ordered[] = 'wp_cron';
+        }
+
+        foreach (array_keys($this->pending_batch) as $lane) {
+            if (!in_array($lane, $ordered, true)) {
+                $ordered[] = $lane;
+            }
+        }
+
+        return $ordered;
+    }
+
+    private function cron_lane_for(Job_Payload $payload): string
+    {
+        foreach ($this->cron_lanes as $lane) {
+            if (!$this->lane_matches($lane, $payload)) {
+                continue;
+            }
+
+            return $lane['name'];
+        }
+
+        return 'wp_cron';
     }
 
     /**
@@ -565,6 +614,28 @@ class Worker_Process
         }
 
         return $this->as_max_batch_size;
+    }
+
+    private function cron_lane_max_concurrent(string $lane_name): int
+    {
+        foreach ($this->cron_lanes as $lane) {
+            if ($lane['name'] === $lane_name) {
+                return (int) $lane['max_concurrent'];
+            }
+        }
+
+        return $this->cron_max_concurrent;
+    }
+
+    private function cron_lane_max_batch_size(string $lane_name): int
+    {
+        foreach ($this->cron_lanes as $lane) {
+            if ($lane['name'] === $lane_name) {
+                return (int) $lane['max_batch_size'];
+            }
+        }
+
+        return $this->cron_max_batch_size;
     }
 
     private function running_process_count(string $lane): int
@@ -989,10 +1060,15 @@ class Worker_Process
                     'pending_timers'  => count($this->pending_timers),
                     'pending_by_source' => $this->pending_payload_counts_by('source'),
                     'pending_by_hook' => $this->pending_payload_counts_by('hook'),
+                    'pending_cron_batches' => $this->pending_cron_count(),
                     'pending_as_batches' => $this->pending_action_scheduler_count(),
                     'running_jobs'    => $this->running_jobs,
+                    'running_cron_jobs' => $this->running_cron_count(),
                     'running_as_jobs' => $this->running_action_scheduler_count(),
+                    'cron_lanes'      => $this->cron_lane_statuses(),
                     'as_lanes'        => $this->action_scheduler_lane_statuses(),
+                    'running_cron_lanes' => $this->running_cron_counts(),
+                    'pending_cron_lanes' => $this->pending_cron_counts(),
                     'running_as_lanes' => $this->running_action_scheduler_counts(),
                     'pending_as_lanes' => $this->pending_action_scheduler_counts(),
                     'memory'          => sprintf('%.1f MB', $mem_mb),
@@ -1042,9 +1118,11 @@ class Worker_Process
     {
         $payloads = array_values($this->pending_timer_payloads);
 
-        foreach ($this->pending_batch as $site_payloads) {
-            foreach ($site_payloads as $payload) {
-                $payloads[] = $payload;
+        foreach ($this->pending_batch as $site_batches) {
+            foreach ($site_batches as $site_payloads) {
+                foreach ($site_payloads as $payload) {
+                    $payloads[] = $payload;
+                }
             }
         }
 
@@ -1095,9 +1173,60 @@ class Worker_Process
         return $statuses;
     }
 
+    private function cron_lane_statuses(): array
+    {
+        $lane_names = [];
+        foreach ($this->cron_lanes as $lane) {
+            if (!empty($lane['name'])) {
+                $lane_names[(string) $lane['name']] = true;
+            }
+        }
+
+        foreach (array_keys($this->pending_cron_counts()) as $lane) {
+            $lane_names[$lane] = true;
+        }
+
+        foreach (array_keys($this->running_cron_counts()) as $lane) {
+            $lane_names[$lane] = true;
+        }
+
+        if (empty($lane_names)) {
+            $lane_names['wp_cron'] = true;
+        }
+
+        $statuses = [];
+        $pending_counts = $this->pending_cron_counts();
+        $running_counts = $this->running_cron_counts();
+        foreach (array_keys($lane_names) as $lane) {
+            $statuses[$lane] = [
+                'pending' => (int) ($pending_counts[$lane] ?? 0),
+                'running' => (int) ($running_counts[$lane] ?? 0),
+                'max'     => $this->cron_lane_max_concurrent($lane),
+                'batch'   => $this->cron_lane_max_batch_size($lane),
+            ];
+        }
+
+        return $statuses;
+    }
+
     private function pending_action_scheduler_count(): int
     {
         return array_sum($this->pending_action_scheduler_counts());
+    }
+
+    private function pending_cron_count(): int
+    {
+        return array_sum($this->pending_cron_counts());
+    }
+
+    private function pending_cron_counts(): array
+    {
+        $counts = [];
+        foreach ($this->pending_batch as $lane => $site_batches) {
+            $counts[$lane] = array_sum(array_map('count', $site_batches));
+        }
+
+        return $counts;
     }
 
     private function pending_action_scheduler_counts(): array
@@ -1114,19 +1243,49 @@ class Worker_Process
     {
         $counts = [];
         foreach ($this->running_processes as $proc) {
-            $lane = $proc['lane'] ?? 'wp_cron';
-            if ($lane === 'wp_cron') {
+            if (!$this->process_has_source($proc, 'action_scheduler')) {
                 continue;
             }
+            $lane = $proc['lane'] ?? 'wp_cron';
             $counts[$lane] = ($counts[$lane] ?? 0) + 1;
         }
 
         return $counts;
     }
 
+    private function running_cron_counts(): array
+    {
+        $counts = [];
+        foreach ($this->running_processes as $proc) {
+            if (!$this->process_has_source($proc, 'wp_cron')) {
+                continue;
+            }
+            $lane = $proc['lane'] ?? 'wp_cron';
+            $counts[$lane] = ($counts[$lane] ?? 0) + 1;
+        }
+
+        return $counts;
+    }
+
+    private function process_has_source(array $proc, string $source): bool
+    {
+        foreach (($proc['payloads'] ?? []) as $payload) {
+            if ($payload instanceof Job_Payload && $payload->source === $source) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private function running_action_scheduler_count(): int
     {
         return array_sum($this->running_action_scheduler_counts());
+    }
+
+    private function running_cron_count(): int
+    {
+        return array_sum($this->running_cron_counts());
     }
 
     /**
