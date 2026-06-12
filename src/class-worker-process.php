@@ -43,6 +43,9 @@ class Worker_Process
     /** @var array<string, int> tracking_key => timer_id */
     private array $pending_timers = [];
 
+    /** @var array<string, Job_Payload> tracking_key => payload */
+    private array $pending_timer_payloads = [];
+
     /** @var list<array{process: resource, pipes: array, payloads: list<Job_Payload>, started: int, stdout: string, stderr: string, lane: string}> */
     private array $running_processes = [];
 
@@ -203,6 +206,7 @@ class Worker_Process
         $delay = max(0, $payload->timestamp - time());
         $timer_id = Timer::add($delay, fn($p) => $this->execute_job($p), [$payload], false);
         $this->pending_timers[$key] = $timer_id;
+        $this->pending_timer_payloads[$key] = $payload;
     }
 
     /**
@@ -212,6 +216,7 @@ class Worker_Process
     {
         $key = $payload->tracking_key();
         unset($this->pending_timers[$key]);
+        unset($this->pending_timer_payloads[$key]);
 
         if ($payload->source === 'action_scheduler') {
             $this->execute_action_scheduler_job($payload);
@@ -223,6 +228,7 @@ class Worker_Process
             // Re-schedule with 2s delay
             $timer_id = Timer::add(2, fn($p) => $this->execute_job($p), [$payload], false);
             $this->pending_timers[$key] = $timer_id;
+            $this->pending_timer_payloads[$key] = $payload;
             return;
         }
 
@@ -252,6 +258,7 @@ class Worker_Process
         if ($this->running_process_count($lane) >= $this->lane_max_concurrent($lane)) {
             $timer_id = Timer::add(1, fn($p) => $this->execute_action_scheduler_job($p), [$payload], false);
             $this->pending_timers[$key] = $timer_id;
+            $this->pending_timer_payloads[$key] = $payload;
             return;
         }
 
@@ -980,9 +987,12 @@ class Worker_Process
                     'uptime'          => sprintf('%dh %dm %ds', $hours, $mins, $secs),
                     'uptime_seconds'  => $uptime,
                     'pending_timers'  => count($this->pending_timers),
+                    'pending_by_source' => $this->pending_payload_counts_by('source'),
+                    'pending_by_hook' => $this->pending_payload_counts_by('hook'),
                     'pending_as_batches' => $this->pending_action_scheduler_count(),
                     'running_jobs'    => $this->running_jobs,
                     'running_as_jobs' => $this->running_action_scheduler_count(),
+                    'as_lanes'        => $this->action_scheduler_lane_statuses(),
                     'running_as_lanes' => $this->running_action_scheduler_counts(),
                     'pending_as_lanes' => $this->pending_action_scheduler_counts(),
                     'memory'          => sprintf('%.1f MB', $mem_mb),
@@ -1007,6 +1017,82 @@ class Worker_Process
                 $connection->close();
                 break;
         }
+    }
+
+    private function pending_payload_counts_by(string $field): array
+    {
+        $counts = [];
+        foreach ($this->pending_payloads_for_status() as $payload) {
+            $value = $field === 'hook' ? $payload->hook : $payload->source;
+            if ($value === '') {
+                $value = 'unknown';
+            }
+            $counts[$value] = ($counts[$value] ?? 0) + 1;
+        }
+
+        arsort($counts);
+
+        return $counts;
+    }
+
+    /**
+     * @return list<Job_Payload>
+     */
+    private function pending_payloads_for_status(): array
+    {
+        $payloads = array_values($this->pending_timer_payloads);
+
+        foreach ($this->pending_batch as $site_payloads) {
+            foreach ($site_payloads as $payload) {
+                $payloads[] = $payload;
+            }
+        }
+
+        foreach ($this->pending_as_batch as $site_batches) {
+            foreach ($site_batches as $site_payloads) {
+                foreach ($site_payloads as $payload) {
+                    $payloads[] = $payload;
+                }
+            }
+        }
+
+        return $payloads;
+    }
+
+    private function action_scheduler_lane_statuses(): array
+    {
+        $lane_names = [];
+        foreach ($this->as_lanes as $lane) {
+            if (!empty($lane['name'])) {
+                $lane_names[(string) $lane['name']] = true;
+            }
+        }
+
+        foreach (array_keys($this->pending_action_scheduler_counts()) as $lane) {
+            $lane_names[$lane] = true;
+        }
+
+        foreach (array_keys($this->running_action_scheduler_counts()) as $lane) {
+            $lane_names[$lane] = true;
+        }
+
+        if (empty($lane_names)) {
+            $lane_names['action_scheduler'] = true;
+        }
+
+        $statuses = [];
+        $pending_counts = $this->pending_action_scheduler_counts();
+        $running_counts = $this->running_action_scheduler_counts();
+        foreach (array_keys($lane_names) as $lane) {
+            $statuses[$lane] = [
+                'pending' => (int) ($pending_counts[$lane] ?? 0),
+                'running' => (int) ($running_counts[$lane] ?? 0),
+                'max'     => $this->lane_max_concurrent($lane),
+                'batch'   => $this->lane_max_batch_size($lane),
+            ];
+        }
+
+        return $statuses;
     }
 
     private function pending_action_scheduler_count(): int
