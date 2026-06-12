@@ -6,14 +6,6 @@ use WP_CLI;
 
 class CLI_Commands
 {
-    private const BYPASS_CRON_HOOKS = [
-        'wp_version_check',
-        'wp_update_plugins',
-        'wp_update_themes',
-        'action_scheduler_run_queue',
-        'action_scheduler_run_cleanup',
-    ];
-
     /**
      * Show queue worker status.
      *
@@ -127,12 +119,12 @@ class CLI_Commands
                 $seen_cron_signatures = [];
                 foreach ($crons as $timestamp => $hooks) {
                     foreach ($hooks as $hook => $events) {
-                        if (in_array($hook, self::BYPASS_CRON_HOOKS, true)) {
+                        if (Cron_Event_Filter::should_bypass($hook)) {
                             continue;
                         }
 
                         foreach ($events as $key => $event) {
-                            $signature = $this->cron_event_signature($hook, $event, (int) $timestamp);
+                            $signature = Cron_Event_Filter::signature($hook, $event, (int) $timestamp);
                             if (isset($seen_cron_signatures[$signature])) {
                                 continue;
                             }
@@ -199,16 +191,4 @@ class CLI_Commands
         WP_CLI::success('Sent restart signal to queue worker. systemd will restart it.');
     }
 
-    private function cron_event_signature(string $hook, array $event, int $timestamp): string
-    {
-        $event_timestamp = empty($event['schedule']) ? $timestamp : 0;
-
-        return sprintf(
-            '%s:%s:%d:%s',
-            $hook,
-            $event['schedule'] ?? '',
-            $event_timestamp,
-            md5(serialize($event['args'] ?? []))
-        );
-    }
 }

@@ -560,18 +560,12 @@ class Worker_Process
                         continue;
                     }
                     foreach ($hooks as $hook => $events) {
-                        if (in_array($hook, [
-                            'wp_version_check',
-                            'wp_update_plugins',
-                            'wp_update_themes',
-                            'action_scheduler_run_queue',
-                            'action_scheduler_run_cleanup',
-                        ], true)) {
+                        if (Cron_Event_Filter::should_bypass($hook)) {
                             continue;
                         }
 
                         foreach ($events as $event) {
-                            $signature = $this->cron_event_signature($hook, $event, (int) $timestamp);
+                            $signature = Cron_Event_Filter::signature($hook, $event, (int) $timestamp);
                             if (isset($seen_cron_signatures[$signature])) {
                                 continue;
                             }
@@ -905,19 +899,6 @@ class Worker_Process
     private function running_action_scheduler_count(): int
     {
         return array_sum($this->running_action_scheduler_counts());
-    }
-
-    private function cron_event_signature(string $hook, array $event, int $timestamp): string
-    {
-        $event_timestamp = empty($event['schedule']) ? $timestamp : 0;
-
-        return sprintf(
-            '%s:%s:%d:%s',
-            $hook,
-            $event['schedule'] ?? '',
-            $event_timestamp,
-            md5(serialize($event['args'] ?? []))
-        );
     }
 
     /**
