@@ -157,6 +157,96 @@ class CLI_Commands
         WP_CLI::success("Sent $count jobs to the queue worker.");
     }
 
+    /**
+     * Report pending, overdue, and failed Action Scheduler actions by hook/group.
+     *
+     * ## OPTIONS
+     *
+     * [--status=<status>]
+     * : Restrict the report to one Action Scheduler status. Supported: pending, failed.
+     *
+     * [--overdue]
+     * : Show only overdue pending actions.
+     *
+     * [--limit=<limit>]
+     * : Maximum grouped rows per section.
+     * ---
+     * default: 20
+     * ---
+     *
+     * [--samples=<samples>]
+     * : Number of sample action IDs per grouped row. Use 0 to hide samples.
+     * ---
+     * default: 5
+     * ---
+     *
+     * ## EXAMPLES
+     *
+     *     wp queue as-report
+     *     wp queue as-report --status=failed --limit=50
+     *     wp queue as-report --overdue
+     *
+     * @subcommand as-report
+     */
+    public function as_report($args, $assoc_args): void
+    {
+        $status = isset($assoc_args['status']) ? strtolower((string) $assoc_args['status']) : '';
+        $overdue_only = (bool) ($assoc_args['overdue'] ?? false);
+        $limit = max(1, (int) ($assoc_args['limit'] ?? 20));
+        $sample_limit = max(0, (int) ($assoc_args['samples'] ?? 5));
+
+        if ($status !== '' && !in_array($status, ['pending', 'failed'], true)) {
+            WP_CLI::error('Unsupported status. Use pending or failed.');
+        }
+
+        if ($overdue_only && $status === 'failed') {
+            WP_CLI::error('--overdue can only be used with pending actions.');
+        }
+
+        $tables = $this->action_scheduler_table_sets();
+        if (empty($tables)) {
+            WP_CLI::warning('No Action Scheduler tables found for the current site/network.');
+            return;
+        }
+
+        if (!class_exists('ActionScheduler') && !function_exists('as_get_scheduled_actions')) {
+            WP_CLI::warning('Action Scheduler is not loaded; reporting directly from existing tables.');
+        }
+
+        $sections = [];
+        if ($overdue_only) {
+            $sections[] = ['label' => 'Overdue pending Action Scheduler actions', 'status' => 'pending', 'overdue' => true];
+        } elseif ($status === 'pending') {
+            $sections[] = ['label' => 'Pending Action Scheduler actions', 'status' => 'pending', 'overdue' => false];
+        } elseif ($status === 'failed') {
+            $sections[] = ['label' => 'Failed Action Scheduler actions', 'status' => 'failed', 'overdue' => false];
+        } else {
+            $sections[] = ['label' => 'Pending Action Scheduler actions', 'status' => 'pending', 'overdue' => false];
+            $sections[] = ['label' => 'Overdue pending Action Scheduler actions', 'status' => 'pending', 'overdue' => true];
+            $sections[] = ['label' => 'Failed Action Scheduler actions', 'status' => 'failed', 'overdue' => false];
+        }
+
+        foreach ($sections as $section) {
+            $rows = $this->action_scheduler_report_rows(
+                $tables,
+                $section['status'],
+                $section['overdue'],
+                $limit,
+                $sample_limit
+            );
+
+            WP_CLI::log('');
+            WP_CLI::log((string) $section['label']);
+
+            if (empty($rows)) {
+                WP_CLI::log('  None found.');
+                continue;
+            }
+
+            \WP_CLI\Utils\format_items('table', $rows, array_keys($rows[0]));
+        }
+    }
+
     private function action_scheduler_tables_exist(): bool
     {
         global $wpdb;
@@ -170,6 +260,157 @@ class CLI_Commands
         }
 
         return true;
+    }
+
+    /**
+     * @return array<int, array{source: string, actions: string, groups: string}>
+     */
+    private function action_scheduler_table_sets(): array
+    {
+        global $wpdb;
+
+        $prefixes = [];
+        $prefixes[$wpdb->prefix] = 'current';
+
+        if (is_multisite()) {
+            $prefixes[$wpdb->base_prefix] = $prefixes[$wpdb->base_prefix] ?? 'network';
+
+            foreach (get_sites(['number' => 0, 'fields' => 'ids']) as $site_id) {
+                $prefix = $wpdb->get_blog_prefix((int) $site_id);
+                $prefixes[$prefix] = $prefixes[$prefix] ?? 'site ' . (int) $site_id;
+            }
+        }
+
+        $tables = [];
+        foreach ($prefixes as $prefix => $source) {
+            $actions_table = $prefix . 'actionscheduler_actions';
+            $groups_table = $prefix . 'actionscheduler_groups';
+
+            if ($this->database_table_exists($actions_table) && $this->database_table_exists($groups_table)) {
+                $tables[$actions_table] = [
+                    'source'  => $source,
+                    'actions' => $actions_table,
+                    'groups'  => $groups_table,
+                ];
+            }
+        }
+
+        return array_values($tables);
+    }
+
+    private function database_table_exists(string $table): bool
+    {
+        global $wpdb;
+
+        $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+
+        return $found === $table;
+    }
+
+    /**
+     * @param array<int, array{source: string, actions: string, groups: string}> $tables
+     * @return array<int, array<string, string|int>>
+     */
+    private function action_scheduler_report_rows(array $tables, string $status, bool $overdue, int $limit, int $sample_limit): array
+    {
+        global $wpdb;
+
+        $rows = [];
+        $now_gmt = current_time('mysql', true);
+
+        foreach ($tables as $table_set) {
+            $actions_table = $this->quote_identifier($table_set['actions']);
+            $groups_table = $this->quote_identifier($table_set['groups']);
+            $where = 'a.status = %s';
+            $params = [$status];
+
+            if ($overdue) {
+                $where .= ' AND a.scheduled_date_gmt < %s';
+                $params[] = $now_gmt;
+            }
+
+            $params[] = $limit;
+
+            $sql = $wpdb->prepare(
+                "SELECT a.hook, COALESCE(g.slug, '') AS group_slug, COUNT(*) AS action_count, MIN(a.scheduled_date_gmt) AS oldest_date, MAX(a.scheduled_date_gmt) AS latest_date
+                FROM {$actions_table} a
+                LEFT JOIN {$groups_table} g ON g.group_id = a.group_id
+                WHERE {$where}
+                GROUP BY a.hook, g.slug
+                ORDER BY action_count DESC, oldest_date ASC
+                LIMIT %d",
+                $params
+            );
+
+            foreach ($wpdb->get_results($sql, ARRAY_A) as $result) {
+                $row = [
+                    'source'      => $table_set['source'],
+                    'hook'        => (string) $result['hook'],
+                    'group'       => $result['group_slug'] !== '' ? (string) $result['group_slug'] : '(none)',
+                    'count'       => (int) $result['action_count'],
+                    'oldest_date' => (string) $result['oldest_date'],
+                    'latest_date' => (string) $result['latest_date'],
+                ];
+
+                if ($sample_limit > 0) {
+                    $row['sample_ids'] = $this->sample_action_ids(
+                        $table_set['actions'],
+                        $table_set['groups'],
+                        (string) $result['hook'],
+                        (string) $result['group_slug'],
+                        $status,
+                        $overdue,
+                        $now_gmt,
+                        $sample_limit
+                    );
+                }
+
+                $rows[] = $row;
+            }
+        }
+
+        usort($rows, static function (array $left, array $right): int {
+            return $right['count'] <=> $left['count'] ?: strcmp((string) $left['oldest_date'], (string) $right['oldest_date']);
+        });
+
+        return array_slice($rows, 0, $limit);
+    }
+
+    private function sample_action_ids(string $actions_table, string $groups_table, string $hook, string $group_slug, string $status, bool $overdue, string $now_gmt, int $limit): string
+    {
+        global $wpdb;
+
+        $actions_table = $this->quote_identifier($actions_table);
+        $groups_table = $this->quote_identifier($groups_table);
+        $where = 'a.hook = %s AND a.status = %s AND COALESCE(g.slug, \'\') = %s';
+        $params = [$hook, $status, $group_slug];
+
+        if ($overdue) {
+            $where .= ' AND a.scheduled_date_gmt < %s';
+            $params[] = $now_gmt;
+        }
+
+        $params[] = $limit;
+        $sql = $wpdb->prepare(
+            "SELECT a.action_id
+            FROM {$actions_table} a
+            LEFT JOIN {$groups_table} g ON g.group_id = a.group_id
+            WHERE {$where}
+            ORDER BY a.scheduled_date_gmt ASC, a.action_id ASC
+            LIMIT %d",
+            $params
+        );
+
+        return implode(',', array_map('strval', $wpdb->get_col($sql)));
+    }
+
+    private function quote_identifier(string $identifier): string
+    {
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $identifier)) {
+            WP_CLI::error('Unsafe database identifier encountered.');
+        }
+
+        return '`' . $identifier . '`';
     }
 
     /**
