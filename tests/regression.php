@@ -25,6 +25,42 @@ namespace Workerman {
     }
 }
 
+namespace WP_CLI\Utils {
+    function format_items(string $format, array $items, array $fields): void
+    {
+    }
+}
+
+namespace {
+    class WP_CLI
+    {
+        public static array $errors = [];
+        public static array $logs = [];
+        public static array $successes = [];
+
+        public static function error(string $message): void
+        {
+            self::$errors[] = $message;
+            throw new RuntimeException($message);
+        }
+
+        public static function warning(string $message): void
+        {
+            self::$logs[] = 'WARNING: ' . $message;
+        }
+
+        public static function log(string $message): void
+        {
+            self::$logs[] = $message;
+        }
+
+        public static function success(string $message): void
+        {
+            self::$successes[] = $message;
+        }
+    }
+}
+
 namespace {
     use QueueWorker\Config;
     use QueueWorker\Cron_Event_Filter;
@@ -36,6 +72,7 @@ namespace {
     $GLOBALS['test_crons'] = [];
     $GLOBALS['test_current_blog_id'] = 1;
     $GLOBALS['test_switched_blogs'] = [];
+    $GLOBALS['test_unscheduled_events'] = [];
 
     class Test_WPDB
     {
@@ -75,6 +112,11 @@ namespace {
         return (int) $GLOBALS['test_current_blog_id'];
     }
 
+    function is_multisite(): bool
+    {
+        return false;
+    }
+
     function wp_get_schedules(): array
     {
         return [
@@ -105,6 +147,17 @@ namespace {
     function _get_cron_array(): array
     {
         return $GLOBALS['test_crons'];
+    }
+
+    function wp_unschedule_event(int $timestamp, string $hook, array $args = []): bool
+    {
+        $GLOBALS['test_unscheduled_events'][] = [
+            'timestamp' => $timestamp,
+            'hook'      => $hook,
+            'args'      => $args,
+        ];
+
+        return true;
     }
 
     function assert_true(bool $condition, string $message): void
@@ -139,6 +192,7 @@ namespace {
 
     require_once __DIR__ . '/../src/class-config.php';
     require_once __DIR__ . '/../src/class-cron-event-filter.php';
+    require_once __DIR__ . '/../src/class-cli-commands.php';
     require_once __DIR__ . '/../src/class-job-payload.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
 
@@ -220,6 +274,55 @@ namespace {
     assert_same(1, count($pending), 'Worker scan must skip bypass hooks and collapse duplicate cron signatures');
     $scheduled_payload = private_property($scan_worker, 'pending_timers') ? array_key_first($pending) : '';
     assert_true(str_contains($scheduled_payload, 'custom_hook'), 'Worker scan must schedule the non-bypassed hook');
+
+    $GLOBALS['test_crons'] = [
+        300 => [
+            'recurring_hook' => [
+                'first' => ['schedule' => 'hourly', 'args' => ['a' => 1]],
+            ],
+            'one_shot_hook' => [
+                'one' => ['schedule' => '', 'args' => ['a' => 1]],
+            ],
+        ],
+        100 => [
+            'recurring_hook' => [
+                'earliest' => ['schedule' => 'hourly', 'args' => ['a' => 1]],
+            ],
+        ],
+        200 => [
+            'recurring_hook' => [
+                'middle' => ['schedule' => 'hourly', 'args' => ['a' => 1]],
+                'different_args' => ['schedule' => 'hourly', 'args' => ['a' => 2]],
+            ],
+            'one_shot_hook' => [
+                'two' => ['schedule' => '', 'args' => ['a' => 1]],
+            ],
+        ],
+    ];
+    $cli = new QueueWorker\CLI_Commands();
+    $groups = invoke_private($cli, 'cron_duplicate_groups', [$GLOBALS['test_crons']]);
+    $duplicate_groups = array_values(array_filter($groups, static function (array $group): bool {
+        return count($group['events']) > 1;
+    }));
+    assert_same(1, count($duplicate_groups), 'Only recurring events with identical hook, schedule, and args should be duplicate groups');
+    assert_same('recurring_hook', $duplicate_groups[0]['hook'], 'Duplicate group must preserve the hook');
+    assert_same(100, $duplicate_groups[0]['events'][0]['timestamp'], 'Earliest duplicate timestamp must be retained');
+    assert_same(200, $duplicate_groups[0]['events'][1]['timestamp'], 'Later duplicate timestamps must be sorted for removal');
+    assert_same(300, $duplicate_groups[0]['events'][2]['timestamp'], 'Latest duplicate timestamp must be sorted last');
+
+    $GLOBALS['test_unscheduled_events'] = [];
+    $dry_report = invoke_private($cli, 'cron_dedupe_site_report', [1, false]);
+    assert_same(1, $dry_report['groups'], 'Dry-run must report one duplicate recurring group');
+    assert_same(1, $dry_report['retained'], 'Dry-run must retain one event per duplicate group');
+    assert_same(2, $dry_report['removed'], 'Dry-run must count later duplicate events as removable');
+    assert_same([], $GLOBALS['test_unscheduled_events'], 'Dry-run must not unschedule events');
+
+    $apply_report = invoke_private($cli, 'cron_dedupe_site_report', [1, true]);
+    assert_same(2, $apply_report['removed'], 'Apply must count removed duplicate events');
+    assert_same([
+        ['timestamp' => 200, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
+        ['timestamp' => 300, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
+    ], $GLOBALS['test_unscheduled_events'], 'Apply must unschedule only later duplicate recurring events');
 
     echo "Regression tests passed.\n";
 }
