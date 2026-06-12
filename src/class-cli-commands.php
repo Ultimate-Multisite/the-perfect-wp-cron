@@ -32,7 +32,8 @@ class CLI_Commands
 
         $data = Socket_Client::send_command('status');
         if (!$data) {
-            WP_CLI::warning('Worker did not respond to status request.');
+            $error = Socket_Client::get_last_error() ?: 'unknown_error';
+            WP_CLI::warning(sprintf('Worker status request failed: %s.', $error));
             return;
         }
 
@@ -44,6 +45,14 @@ class CLI_Commands
         WP_CLI::log(sprintf('  Running jobs:   %d', $data['running_jobs'] ?? 0));
         WP_CLI::log(sprintf('  Running AS:     %d', $data['running_as_jobs'] ?? 0));
         WP_CLI::log(sprintf('  Memory:         %s', $data['memory'] ?? 'unknown'));
+
+        if (!empty($data['rescan']) && is_array($data['rescan'])) {
+            WP_CLI::log(sprintf(
+                '  Rescan:         %s (last duration: %ds)',
+                !empty($data['rescan']['in_progress']) ? 'in progress' : 'idle',
+                (int) ($data['rescan']['last_duration'] ?? 0)
+            ));
+        }
 
         if (!empty($data['pending_as_lanes'])) {
             WP_CLI::log('  Pending AS lanes:');
