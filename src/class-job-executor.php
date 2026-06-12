@@ -40,6 +40,7 @@ class Job_Executor
             $source    = $job['source'] ?? 'wp_cron';
             $hook      = $job['hook'];
             $job_start = microtime(true);
+            $scheduled = (int) ($job['timestamp'] ?? 0);
             $status    = 'ok';
             $error     = null;
 
@@ -64,14 +65,23 @@ class Job_Executor
 
             $this->cancel_alarm();
 
-            $duration_ms = (int) round((microtime(true) - $job_start) * 1000);
+            $job_completed = microtime(true);
+            $duration_ms   = (int) round(($job_completed - $job_start) * 1000);
+            $wait_ms       = $scheduled > 0 ? max(0, (int) round(($job_start - $scheduled) * 1000)) : null;
             Job_Log::insert(
                 (int) ($job['site_id'] ?? $this->site_id),
                 $hook,
                 $source,
                 $status,
                 $duration_ms,
-                $error
+                $error,
+                $scheduled > 0 ? gmdate('Y-m-d H:i:s', $scheduled) : null,
+                gmdate('Y-m-d H:i:s', (int) $job_start),
+                gmdate('Y-m-d H:i:s', (int) $job_completed),
+                $wait_ms,
+                $duration_ms,
+                (string) ($job['lane'] ?? ($source === 'action_scheduler' ? 'action_scheduler' : 'wp_cron')),
+                !empty($job['action_id']) ? (int) $job['action_id'] : null
             );
         }
 

@@ -14,6 +14,7 @@ class Job_Payload
     public string $source; // 'wp_cron' | 'action_scheduler'
     public int $action_id;
     public string $group;
+    public string $lane;
 
     public function __construct(array $data = [])
     {
@@ -27,6 +28,7 @@ class Job_Payload
         $this->source    = $data['source'] ?? 'wp_cron';
         $this->action_id = $data['action_id'] ?? 0;
         $this->group     = $data['group'] ?? '';
+        $this->lane      = $data['lane'] ?? ($this->source === 'action_scheduler' ? 'action_scheduler' : 'wp_cron');
     }
 
     public function to_json(): string
@@ -42,6 +44,7 @@ class Job_Payload
             'source'    => $this->source,
             'action_id' => $this->action_id,
             'group'     => $this->group,
+            'lane'      => $this->lane,
         ]);
     }
 

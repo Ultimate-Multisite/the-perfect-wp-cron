@@ -265,7 +265,7 @@ class Worker_Process
     private function spawn_batch(array $payloads, int $worker_id, string $lane = 'wp_cron'): void
     {
         $json_array = array_map(
-            fn($p) => json_decode($p->to_json(), true),
+            fn($p) => array_merge(json_decode($p->to_json(), true), ['lane' => $lane]),
             $payloads
         );
         $json_data = json_encode($json_array);

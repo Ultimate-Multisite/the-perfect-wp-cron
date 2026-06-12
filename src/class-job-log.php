@@ -21,17 +21,56 @@ class Job_Log
             site_id BIGINT UNSIGNED NOT NULL,
             hook VARCHAR(255) NOT NULL,
             source VARCHAR(20) NOT NULL DEFAULT 'wp_cron',
+            lane VARCHAR(100) NULL,
+            action_id BIGINT UNSIGNED NULL,
             status VARCHAR(10) NOT NULL DEFAULT 'ok',
             duration_ms INT UNSIGNED NOT NULL DEFAULT 0,
+            wait_ms INT UNSIGNED NULL,
+            execution_ms INT UNSIGNED NULL,
             error_msg TEXT NULL,
+            scheduled_at DATETIME NULL,
+            started_at DATETIME NULL,
             completed_at DATETIME NOT NULL,
             PRIMARY KEY (id),
             KEY site_hook (site_id, hook),
+            KEY lane (lane),
+            KEY action_id (action_id),
             KEY status (status),
+            KEY scheduled_at (scheduled_at),
             KEY completed_at (completed_at)
         ) ENGINE=InnoDB $charset";
 
         $wpdb->query($sql);
+
+        self::add_column_if_missing($table, 'lane', 'ALTER TABLE `' . $table . '` ADD `lane` VARCHAR(100) NULL AFTER `source`');
+        self::add_column_if_missing($table, 'action_id', 'ALTER TABLE `' . $table . '` ADD `action_id` BIGINT UNSIGNED NULL AFTER `lane`');
+        self::add_column_if_missing($table, 'wait_ms', 'ALTER TABLE `' . $table . '` ADD `wait_ms` INT UNSIGNED NULL AFTER `duration_ms`');
+        self::add_column_if_missing($table, 'execution_ms', 'ALTER TABLE `' . $table . '` ADD `execution_ms` INT UNSIGNED NULL AFTER `wait_ms`');
+        self::add_column_if_missing($table, 'scheduled_at', 'ALTER TABLE `' . $table . '` ADD `scheduled_at` DATETIME NULL AFTER `error_msg`');
+        self::add_column_if_missing($table, 'started_at', 'ALTER TABLE `' . $table . '` ADD `started_at` DATETIME NULL AFTER `scheduled_at`');
+        self::add_index_if_missing($table, 'lane', 'ALTER TABLE `' . $table . '` ADD KEY `lane` (`lane`)');
+        self::add_index_if_missing($table, 'action_id', 'ALTER TABLE `' . $table . '` ADD KEY `action_id` (`action_id`)');
+        self::add_index_if_missing($table, 'scheduled_at', 'ALTER TABLE `' . $table . '` ADD KEY `scheduled_at` (`scheduled_at`)');
+    }
+
+    private static function add_column_if_missing(string $table, string $column, string $alter_sql): void
+    {
+        global $wpdb;
+
+        $exists = $wpdb->get_var($wpdb->prepare("SHOW COLUMNS FROM `$table` LIKE %s", $column));
+        if ($exists === null) {
+            $wpdb->query($alter_sql);
+        }
+    }
+
+    private static function add_index_if_missing(string $table, string $index, string $alter_sql): void
+    {
+        global $wpdb;
+
+        $exists = $wpdb->get_var($wpdb->prepare("SHOW INDEX FROM `$table` WHERE Key_name = %s", $index));
+        if ($exists === null) {
+            $wpdb->query($alter_sql);
+        }
     }
 
     public static function insert(
@@ -40,7 +79,14 @@ class Job_Log
         string $source,
         string $status,
         int $duration_ms,
-        ?string $error_msg = null
+        ?string $error_msg = null,
+        ?string $scheduled_at = null,
+        ?string $started_at = null,
+        ?string $completed_at = null,
+        ?int $wait_ms = null,
+        ?int $execution_ms = null,
+        ?string $lane = null,
+        ?int $action_id = null
     ): void {
         global $wpdb;
         $table = self::table();
@@ -49,11 +95,17 @@ class Job_Log
             'site_id'      => $site_id,
             'hook'         => $hook,
             'source'       => $source,
+            'lane'         => $lane,
+            'action_id'    => $action_id,
             'status'       => $status,
             'duration_ms'  => $duration_ms,
+            'wait_ms'      => $wait_ms,
+            'execution_ms' => $execution_ms,
             'error_msg'    => $error_msg,
-            'completed_at' => current_time('mysql', true),
-        ], ['%d', '%s', '%s', '%s', '%d', '%s', '%s']);
+            'scheduled_at' => $scheduled_at,
+            'started_at'   => $started_at,
+            'completed_at' => $completed_at ?: current_time('mysql', true),
+        ], ['%d', '%s', '%s', '%s', '%d', '%s', '%d', '%d', '%d', '%s', '%s', '%s', '%s']);
     }
 
     public static function query(array $args = []): array
@@ -95,7 +147,7 @@ class Job_Log
 
         $where_sql = $where ? 'WHERE ' . implode(' AND ', $where) : '';
 
-        $allowed_orderby = ['completed_at', 'duration_ms', 'site_id', 'hook', 'status'];
+        $allowed_orderby = ['completed_at', 'scheduled_at', 'started_at', 'duration_ms', 'wait_ms', 'execution_ms', 'site_id', 'hook', 'status', 'source', 'lane', 'action_id'];
         $orderby = in_array($args['orderby'], $allowed_orderby, true) ? $args['orderby'] : 'completed_at';
         $order = strtoupper($args['order']) === 'ASC' ? 'ASC' : 'DESC';
 

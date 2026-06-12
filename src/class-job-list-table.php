@@ -23,8 +23,11 @@ class Job_List_Table extends \WP_List_Table
             'site_id'      => 'Site',
             'hook'         => 'Hook',
             'source'       => 'Source',
+            'lane'         => 'Lane',
+            'action_id'    => 'Action ID',
             'status'       => 'Status',
-            'duration_ms'  => 'Duration',
+            'wait_ms'      => 'Wait',
+            'duration_ms'  => 'Execution',
             'error_msg'    => 'Error',
             'completed_at' => 'Completed',
         ];
@@ -34,9 +37,13 @@ class Job_List_Table extends \WP_List_Table
     {
         return [
             'completed_at' => ['completed_at', true], // default DESC
+            'wait_ms'      => ['wait_ms', false],
             'duration_ms'  => ['duration_ms', false],
+            'execution_ms' => ['execution_ms', false],
             'site_id'      => ['site_id', false],
             'hook'         => ['hook', false],
+            'lane'         => ['lane', false],
+            'action_id'    => ['action_id', false],
         ];
     }
 
@@ -197,6 +204,18 @@ class Job_List_Table extends \WP_List_Table
             : '<span class="qw-source qw-source-cron">Cron</span>';
     }
 
+    protected function column_lane($item): string
+    {
+        $lane = $item['lane'] ?? '';
+        return $lane !== '' ? '<code>' . esc_html($lane) . '</code>' : '&mdash;';
+    }
+
+    protected function column_action_id($item): string
+    {
+        $action_id = (int) ($item['action_id'] ?? 0);
+        return $action_id > 0 ? (string) $action_id : '&mdash;';
+    }
+
     protected function column_status($item): string
     {
         $status = $item['status'] ?? 'ok';
@@ -211,7 +230,16 @@ class Job_List_Table extends \WP_List_Table
 
     protected function column_duration_ms($item): string
     {
-        return self::format_duration((int) $item['duration_ms']);
+        return self::format_duration((int) ($item['execution_ms'] ?? $item['duration_ms']));
+    }
+
+    protected function column_wait_ms($item): string
+    {
+        if (!isset($item['wait_ms']) || $item['wait_ms'] === null) {
+            return '&mdash;';
+        }
+
+        return self::format_duration((int) $item['wait_ms']);
     }
 
     protected function column_error_msg($item): string
