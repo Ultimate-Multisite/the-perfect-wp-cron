@@ -188,6 +188,11 @@ namespace {
     assert_true(Cron_Event_Filter::should_bypass('wp_update_plugins'), 'Bypass hook must be skipped by shared cron filter');
     assert_true(Cron_Event_Filter::should_bypass('action_scheduler_run_queue'), 'Action Scheduler queue runner must be skipped by shared cron filter');
     assert_true(!Cron_Event_Filter::should_bypass('custom_hook'), 'Custom hooks must not be bypassed by shared cron filter');
+    putenv('QUEUE_WORKER_BYPASS_CRON_HOOKS=custom_hook, extra_hook');
+    assert_true(Cron_Event_Filter::should_bypass('wp_update_plugins'), 'Default bypass hooks must remain active when custom hooks are configured');
+    assert_true(Cron_Event_Filter::should_bypass('custom_hook'), 'Configured bypass hook must be skipped by shared cron filter');
+    assert_true(Cron_Event_Filter::should_bypass('extra_hook'), 'Comma-separated bypass hooks must be normalized');
+    putenv('QUEUE_WORKER_BYPASS_CRON_HOOKS');
     assert_same(
         Cron_Event_Filter::signature('custom_hook', ['schedule' => 'hourly', 'args' => ['a' => 1]], 100),
         Cron_Event_Filter::signature('custom_hook', ['schedule' => 'hourly', 'args' => ['a' => 1]], 200),

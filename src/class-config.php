@@ -4,6 +4,14 @@ namespace QueueWorker;
 
 class Config
 {
+    private const DEFAULT_BYPASS_CRON_HOOKS = [
+        'wp_version_check',
+        'wp_update_plugins',
+        'wp_update_themes',
+        'action_scheduler_run_queue',
+        'action_scheduler_run_cleanup',
+    ];
+
     public static function socket_path(): string
     {
         return self::get('QUEUE_WORKER_SOCKET_PATH', '/tmp/the-perfect-wp-cron.sock');
@@ -70,6 +78,14 @@ class Config
     public static function low_priority_hooks(): array
     {
         return self::normalize_string_list(self::get('QUEUE_WORKER_LOW_PRIORITY_HOOKS', []));
+    }
+
+    public static function bypass_cron_hooks(): array
+    {
+        return array_values(array_unique(array_merge(
+            self::DEFAULT_BYPASS_CRON_HOOKS,
+            self::normalize_string_list(self::get('QUEUE_WORKER_BYPASS_CRON_HOOKS', []))
+        )));
     }
 
     public static function max_batch_size(): int
