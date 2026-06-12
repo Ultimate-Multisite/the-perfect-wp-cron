@@ -58,12 +58,54 @@ class Config
             }
 
             $normalized[] = [
-                'name'           => self::sanitize_lane_name((string) $lane['name']),
+                'name'           => self::sanitize_lane_name((string) $lane['name'], 'action_scheduler'),
                 'sites'          => self::normalize_int_list($lane['sites'] ?? $lane['site_ids'] ?? []),
                 'groups'         => self::normalize_string_list($lane['groups'] ?? []),
                 'hooks'          => self::normalize_string_list($lane['hooks'] ?? []),
                 'max_concurrent' => max(1, (int) ($lane['max_concurrent'] ?? self::action_scheduler_max_concurrent())),
                 'max_batch_size' => max(1, (int) ($lane['max_batch_size'] ?? self::action_scheduler_max_batch_size())),
+            ];
+        }
+
+        return $normalized;
+    }
+
+    public static function cron_max_concurrent(): int
+    {
+        return (int) self::get('QUEUE_WORKER_CRON_MAX_CONCURRENT', self::max_concurrent());
+    }
+
+    public static function cron_max_batch_size(): int
+    {
+        return (int) self::get('QUEUE_WORKER_CRON_MAX_BATCH_SIZE', self::max_batch_size());
+    }
+
+    public static function cron_lanes(): array
+    {
+        $value = self::get('QUEUE_WORKER_CRON_LANES', []);
+        if (is_string($value)) {
+            if (trim($value) === '') {
+                return [];
+            }
+            $value = json_decode($value, true);
+        }
+
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($value as $lane) {
+            if (!is_array($lane) || empty($lane['name'])) {
+                continue;
+            }
+
+            $normalized[] = [
+                'name'           => self::sanitize_lane_name((string) $lane['name'], 'wp_cron'),
+                'sites'          => self::normalize_int_list($lane['sites'] ?? $lane['site_ids'] ?? []),
+                'hooks'          => self::normalize_string_list($lane['hooks'] ?? []),
+                'max_concurrent' => max(1, (int) ($lane['max_concurrent'] ?? self::cron_max_concurrent())),
+                'max_batch_size' => max(1, (int) ($lane['max_batch_size'] ?? self::cron_max_batch_size())),
             ];
         }
 
@@ -158,11 +200,11 @@ class Config
         return $default;
     }
 
-    private static function sanitize_lane_name(string $name): string
+    private static function sanitize_lane_name(string $name, string $default): string
     {
         $name = preg_replace('/[^a-zA-Z0-9_.:-]+/', '-', trim($name));
-        if ($name === '' || $name === 'wp_cron') {
-            return 'action_scheduler';
+        if ($name === '' || $name === 'wp_cron' || $name === 'action_scheduler') {
+            return $default;
         }
 
         return $name;

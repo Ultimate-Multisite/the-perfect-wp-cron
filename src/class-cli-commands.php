@@ -33,8 +33,10 @@ class CLI_Commands
         WP_CLI::log(sprintf('  PID:            %d', $data['pid'] ?? 0));
         WP_CLI::log(sprintf('  Uptime:         %s', $data['uptime'] ?? 'unknown'));
         WP_CLI::log(sprintf('  Pending timers: %d', $data['pending_timers'] ?? 0));
+        WP_CLI::log(sprintf('  Pending cron:   %d', $data['pending_cron_batches'] ?? 0));
         WP_CLI::log(sprintf('  Pending AS:     %d', $data['pending_as_batches'] ?? 0));
         WP_CLI::log(sprintf('  Running jobs:   %d', $data['running_jobs'] ?? 0));
+        WP_CLI::log(sprintf('  Running cron:   %d', $data['running_cron_jobs'] ?? 0));
         WP_CLI::log(sprintf('  Running AS:     %d', $data['running_as_jobs'] ?? 0));
         WP_CLI::log(sprintf('  Memory:         %s', $data['memory'] ?? 'unknown'));
 
@@ -66,6 +68,20 @@ class CLI_Commands
             }
         }
 
+        if (!empty($data['cron_lanes']) && is_array($data['cron_lanes'])) {
+            WP_CLI::log('  Cron lanes:');
+            foreach ($data['cron_lanes'] as $lane => $details) {
+                WP_CLI::log(sprintf(
+                    '    - %s: pending %d, running %d, max %d, batch %d',
+                    $lane,
+                    (int) ($details['pending'] ?? 0),
+                    (int) ($details['running'] ?? 0),
+                    (int) ($details['max'] ?? 0),
+                    (int) ($details['batch'] ?? 0)
+                ));
+            }
+        }
+
         if (!empty($data['as_lanes']) && is_array($data['as_lanes'])) {
             WP_CLI::log('  AS lanes:');
             foreach ($data['as_lanes'] as $lane => $details) {
@@ -80,9 +96,23 @@ class CLI_Commands
             }
         }
 
+        if (empty($data['cron_lanes']) && !empty($data['pending_cron_lanes'])) {
+            WP_CLI::log('  Pending cron lanes:');
+            foreach ($data['pending_cron_lanes'] as $lane => $count) {
+                WP_CLI::log(sprintf('    - %s: %d', $lane, $count));
+            }
+        }
+
         if (empty($data['as_lanes']) && !empty($data['pending_as_lanes'])) {
             WP_CLI::log('  Pending AS lanes:');
             foreach ($data['pending_as_lanes'] as $lane => $count) {
+                WP_CLI::log(sprintf('    - %s: %d', $lane, $count));
+            }
+        }
+
+        if (empty($data['cron_lanes']) && !empty($data['running_cron_lanes'])) {
+            WP_CLI::log('  Running cron lanes:');
+            foreach ($data['running_cron_lanes'] as $lane => $count) {
                 WP_CLI::log(sprintf('    - %s: %d', $lane, $count));
             }
         }
