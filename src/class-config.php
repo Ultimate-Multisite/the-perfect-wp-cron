@@ -29,6 +29,39 @@ class Config
         return (int) self::get('QUEUE_WORKER_AS_MAX_BATCH_SIZE', 10);
     }
 
+    public static function action_scheduler_lanes(): array
+    {
+        $value = self::get('QUEUE_WORKER_AS_LANES', []);
+        if (is_string($value)) {
+            if (trim($value) === '') {
+                return [];
+            }
+            $value = json_decode($value, true);
+        }
+
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($value as $lane) {
+            if (!is_array($lane) || empty($lane['name'])) {
+                continue;
+            }
+
+            $normalized[] = [
+                'name'           => self::sanitize_lane_name((string) $lane['name']),
+                'sites'          => self::normalize_int_list($lane['sites'] ?? $lane['site_ids'] ?? []),
+                'groups'         => self::normalize_string_list($lane['groups'] ?? []),
+                'hooks'          => self::normalize_string_list($lane['hooks'] ?? []),
+                'max_concurrent' => max(1, (int) ($lane['max_concurrent'] ?? self::action_scheduler_max_concurrent())),
+                'max_batch_size' => max(1, (int) ($lane['max_batch_size'] ?? self::action_scheduler_max_batch_size())),
+            ];
+        }
+
+        return $normalized;
+    }
+
     public static function max_batch_size(): int
     {
         return (int) self::get('QUEUE_WORKER_MAX_BATCH_SIZE', 50);
@@ -47,6 +80,11 @@ class Config
     public static function rescan_interval(): int
     {
         return (int) self::get('QUEUE_WORKER_RESCAN_INTERVAL', 60);
+    }
+
+    public static function action_scheduler_rescan_interval(): int
+    {
+        return max(1, (int) self::get('QUEUE_WORKER_AS_RESCAN_INTERVAL', 5));
     }
 
     public static function memory_limit(): int
@@ -92,5 +130,43 @@ class Config
             return $env;
         }
         return $default;
+    }
+
+    private static function sanitize_lane_name(string $name): string
+    {
+        $name = preg_replace('/[^a-zA-Z0-9_.:-]+/', '-', trim($name));
+        if ($name === '' || $name === 'wp_cron') {
+            return 'action_scheduler';
+        }
+
+        return $name;
+    }
+
+    private static function normalize_int_list(mixed $value): array
+    {
+        $items = is_array($value) ? $value : [$value];
+        $result = [];
+        foreach ($items as $item) {
+            if ($item === '' || $item === null) {
+                continue;
+            }
+            $result[] = (int) $item;
+        }
+
+        return array_values(array_unique(array_filter($result)));
+    }
+
+    private static function normalize_string_list(mixed $value): array
+    {
+        $items = is_array($value) ? $value : [$value];
+        $result = [];
+        foreach ($items as $item) {
+            $item = trim((string) $item);
+            if ($item !== '') {
+                $result[] = $item;
+            }
+        }
+
+        return array_values(array_unique($result));
     }
 }

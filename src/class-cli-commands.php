@@ -6,6 +6,14 @@ use WP_CLI;
 
 class CLI_Commands
 {
+    private const BYPASS_CRON_HOOKS = [
+        'wp_version_check',
+        'wp_update_plugins',
+        'wp_update_themes',
+        'action_scheduler_run_queue',
+        'action_scheduler_run_cleanup',
+    ];
+
     /**
      * Show queue worker status.
      *
@@ -32,14 +40,31 @@ class CLI_Commands
         WP_CLI::log(sprintf('  PID:            %d', $data['pid'] ?? 0));
         WP_CLI::log(sprintf('  Uptime:         %s', $data['uptime'] ?? 'unknown'));
         WP_CLI::log(sprintf('  Pending timers: %d', $data['pending_timers'] ?? 0));
+        WP_CLI::log(sprintf('  Pending AS:     %d', $data['pending_as_batches'] ?? 0));
         WP_CLI::log(sprintf('  Running jobs:   %d', $data['running_jobs'] ?? 0));
+        WP_CLI::log(sprintf('  Running AS:     %d', $data['running_as_jobs'] ?? 0));
         WP_CLI::log(sprintf('  Memory:         %s', $data['memory'] ?? 'unknown'));
+
+        if (!empty($data['pending_as_lanes'])) {
+            WP_CLI::log('  Pending AS lanes:');
+            foreach ($data['pending_as_lanes'] as $lane => $count) {
+                WP_CLI::log(sprintf('    - %s: %d', $lane, $count));
+            }
+        }
+
+        if (!empty($data['running_as_lanes'])) {
+            WP_CLI::log('  Running AS lanes:');
+            foreach ($data['running_as_lanes'] as $lane => $count) {
+                WP_CLI::log(sprintf('    - %s: %d', $lane, $count));
+            }
+        }
 
         if (!empty($data['running_details'])) {
             WP_CLI::log('  Currently executing:');
             foreach ($data['running_details'] as $detail) {
                 WP_CLI::log(sprintf(
-                    '    - site %d: %s (%d jobs, %ds elapsed)',
+                    '    - %s site %d: %s (%d jobs, %ds elapsed)',
+                    $detail['lane'] ?? 'wp_cron',
                     $detail['site_id'],
                     $detail['hook'],
                     $detail['count'],
@@ -90,9 +115,20 @@ class CLI_Commands
 
             $crons = _get_cron_array();
             if (is_array($crons)) {
+                $seen_cron_signatures = [];
                 foreach ($crons as $timestamp => $hooks) {
                     foreach ($hooks as $hook => $events) {
+                        if (in_array($hook, self::BYPASS_CRON_HOOKS, true)) {
+                            continue;
+                        }
+
                         foreach ($events as $key => $event) {
+                            $signature = $this->cron_event_signature($hook, $event, (int) $timestamp);
+                            if (isset($seen_cron_signatures[$signature])) {
+                                continue;
+                            }
+                            $seen_cron_signatures[$signature] = true;
+
                             $event_obj = (object) array_merge($event, [
                                 'hook'      => $hook,
                                 'timestamp' => $timestamp,
@@ -152,5 +188,18 @@ class CLI_Commands
         fclose($socket);
 
         WP_CLI::success('Sent restart signal to queue worker. systemd will restart it.');
+    }
+
+    private function cron_event_signature(string $hook, array $event, int $timestamp): string
+    {
+        $event_timestamp = empty($event['schedule']) ? $timestamp : 0;
+
+        return sprintf(
+            '%s:%s:%d:%s',
+            $hook,
+            $event['schedule'] ?? '',
+            $event_timestamp,
+            md5(serialize($event['args'] ?? []))
+        );
     }
 }
