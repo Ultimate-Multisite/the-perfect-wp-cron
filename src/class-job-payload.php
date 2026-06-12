@@ -120,6 +120,30 @@ class Job_Payload
         );
     }
 
+    public function is_action_scheduler(): bool
+    {
+        return $this->source === 'action_scheduler';
+    }
+
+    public function is_recurring(): bool
+    {
+        return $this->schedule !== '' || $this->interval > 0;
+    }
+
+    public function is_one_shot(): bool
+    {
+        return !$this->is_recurring();
+    }
+
+    public function source_metadata(): string
+    {
+        if ($this->is_action_scheduler()) {
+            return $this->group !== '' ? 'as:' . $this->group : 'as';
+        }
+
+        return $this->is_recurring() ? 'wp_cron:recurring' : 'wp_cron:one-shot';
+    }
+
     private static function current_site_id(): int
     {
         if (defined('WU_MT_SOVEREIGN_TENANT')) {

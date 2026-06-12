@@ -62,6 +62,16 @@ class Config
         return $normalized;
     }
 
+    public static function urgent_hooks(): array
+    {
+        return self::normalize_string_list(self::get('QUEUE_WORKER_URGENT_HOOKS', []));
+    }
+
+    public static function low_priority_hooks(): array
+    {
+        return self::normalize_string_list(self::get('QUEUE_WORKER_LOW_PRIORITY_HOOKS', []));
+    }
+
     public static function max_batch_size(): int
     {
         return (int) self::get('QUEUE_WORKER_MAX_BATCH_SIZE', 50);
@@ -158,6 +168,10 @@ class Config
 
     private static function normalize_string_list(mixed $value): array
     {
+        if (is_string($value)) {
+            $value = explode(',', $value);
+        }
+
         $items = is_array($value) ? $value : [$value];
         $result = [];
         foreach ($items as $item) {

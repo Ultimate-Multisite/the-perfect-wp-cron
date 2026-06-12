@@ -31,6 +31,8 @@ class Worker_Process
     private int $as_max_concurrent;
     private int $as_max_batch_size;
     private array $as_lanes;
+    private array $urgent_hooks;
+    private array $low_priority_hooks;
     private int $as_rescan_interval;
     private int $batch_timeout;
     private int $rescan_interval;
@@ -69,6 +71,8 @@ class Worker_Process
         $this->as_max_concurrent = Config::action_scheduler_max_concurrent();
         $this->as_max_batch_size = Config::action_scheduler_max_batch_size();
         $this->as_lanes       = Config::action_scheduler_lanes();
+        $this->urgent_hooks   = Config::urgent_hooks();
+        $this->low_priority_hooks = Config::low_priority_hooks();
         $this->as_rescan_interval = Config::action_scheduler_rescan_interval();
         $this->batch_timeout   = Config::batch_timeout();
         $this->rescan_interval = Config::rescan_interval();
@@ -305,14 +309,16 @@ class Worker_Process
         ];
 
         $hooks = array_map(fn($p) => $p->hook, $payloads);
+        $priority_summary = $this->batch_priority_summary($payloads);
         Worker::log(sprintf(
-            '[W%d][SPAWN][%s] Batch: %d jobs on site %d (pid %d, %d running): %s',
+            '[W%d][SPAWN][%s] Batch: %d jobs on site %d (pid %d, %d running, priority: %s): %s',
             $worker_id,
             $lane,
             count($payloads),
             $payloads[0]->site_id,
             proc_get_status($process)['pid'] ?? 0,
             $this->running_jobs,
+            $priority_summary,
             implode(', ', array_unique($hooks))
         ));
     }
@@ -324,7 +330,8 @@ class Worker_Process
     {
         $this->flush_action_scheduler_batches();
 
-        foreach ($this->pending_batch as $site_id => $payloads) {
+        foreach ($this->ordered_site_ids_by_priority($this->pending_batch) as $site_id) {
+            $payloads = $this->pending_batch[$site_id] ?? [];
             if (empty($payloads)) {
                 unset($this->pending_batch[$site_id]);
                 continue;
@@ -332,6 +339,7 @@ class Worker_Process
             if (count($this->running_processes) >= $this->max_concurrent) {
                 break;
             }
+            $this->sort_payloads_by_priority($this->pending_batch[$site_id]);
             $batch = array_splice($this->pending_batch[$site_id], 0, $this->max_batch_size);
             // Worker ID isn't critical for batch flush logging; use 0
             $this->spawn_batch($batch, 0);
@@ -346,8 +354,13 @@ class Worker_Process
      */
     private function flush_action_scheduler_batches(): void
     {
-        foreach ($this->pending_as_batch as $lane => $site_batches) {
-            foreach ($site_batches as $site_id => $payloads) {
+        foreach ($this->ordered_action_scheduler_lanes() as $lane) {
+            if (empty($this->pending_as_batch[$lane])) {
+                continue;
+            }
+
+            foreach ($this->ordered_site_ids_by_priority($this->pending_as_batch[$lane]) as $site_id) {
+                $payloads = $this->pending_as_batch[$lane][$site_id] ?? [];
                 if (empty($payloads)) {
                     unset($this->pending_as_batch[$lane][$site_id]);
                     continue;
@@ -355,6 +368,7 @@ class Worker_Process
                 if ($this->running_process_count($lane) >= $this->lane_max_concurrent($lane)) {
                     break;
                 }
+                $this->sort_payloads_by_priority($this->pending_as_batch[$lane][$site_id]);
                 $batch = array_splice($this->pending_as_batch[$lane][$site_id], 0, $this->lane_max_batch_size($lane));
                 $this->spawn_batch($batch, 0, $lane);
                 if (empty($this->pending_as_batch[$lane][$site_id])) {
@@ -366,6 +380,134 @@ class Worker_Process
                 unset($this->pending_as_batch[$lane]);
             }
         }
+    }
+
+    private function ordered_action_scheduler_lanes(): array
+    {
+        $ordered = [];
+        foreach ($this->as_lanes as $lane) {
+            $name = $lane['name'] ?? '';
+            if ($name !== '' && isset($this->pending_as_batch[$name])) {
+                $ordered[] = $name;
+            }
+        }
+
+        foreach (array_keys($this->pending_as_batch) as $lane) {
+            if (!in_array($lane, $ordered, true)) {
+                $ordered[] = $lane;
+            }
+        }
+
+        return $ordered;
+    }
+
+    private function ordered_site_ids_by_priority(array $site_batches): array
+    {
+        $site_ids = array_keys($site_batches);
+        usort($site_ids, function (int $left, int $right) use ($site_batches): int {
+            $left_payload = $this->highest_priority_payload($site_batches[$left] ?? []);
+            $right_payload = $this->highest_priority_payload($site_batches[$right] ?? []);
+
+            if ($left_payload === null || $right_payload === null) {
+                return ($left_payload === null) <=> ($right_payload === null);
+            }
+
+            $rank = $this->payload_priority_rank($left_payload) <=> $this->payload_priority_rank($right_payload);
+            if ($rank !== 0) {
+                return $rank;
+            }
+
+            $timestamp = $left_payload->timestamp <=> $right_payload->timestamp;
+            if ($timestamp !== 0) {
+                return $timestamp;
+            }
+
+            return $left <=> $right;
+        });
+
+        return $site_ids;
+    }
+
+    private function highest_priority_payload(array $payloads): ?Job_Payload
+    {
+        if (empty($payloads)) {
+            return null;
+        }
+
+        $this->sort_payloads_by_priority($payloads);
+
+        return $payloads[0];
+    }
+
+    private function sort_payloads_by_priority(array &$payloads): void
+    {
+        uasort($payloads, function (Job_Payload $left, Job_Payload $right): int {
+            $rank = $this->payload_priority_rank($left) <=> $this->payload_priority_rank($right);
+            if ($rank !== 0) {
+                return $rank;
+            }
+
+            $timestamp = $left->timestamp <=> $right->timestamp;
+            if ($timestamp !== 0) {
+                return $timestamp;
+            }
+
+            return strcmp($left->tracking_key(), $right->tracking_key());
+        });
+
+        $payloads = array_values($payloads);
+    }
+
+    private function payload_priority_rank(Job_Payload $payload): int
+    {
+        if ($this->hook_matches($payload->hook, $this->urgent_hooks)) {
+            return 10;
+        }
+
+        if ($this->hook_matches($payload->hook, $this->low_priority_hooks) || $this->is_maintenance_hook($payload->hook)) {
+            return 40;
+        }
+
+        if ($payload->is_one_shot()) {
+            return 20;
+        }
+
+        if ($payload->is_recurring() && $this->is_business_recurring_hook($payload->hook)) {
+            return 30;
+        }
+
+        return $payload->is_recurring() ? 35 : 25;
+    }
+
+    private function hook_matches(string $hook, array $patterns): bool
+    {
+        foreach ($patterns as $pattern) {
+            if ($hook === $pattern || fnmatch($pattern, $hook)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function is_business_recurring_hook(string $hook): bool
+    {
+        return (bool) preg_match('/(import|domain|payment|billing|checkout)/i', $hook);
+    }
+
+    private function is_maintenance_hook(string $hook): bool
+    {
+        return (bool) preg_match('/(cleanup|clean|gc|cache|update|statistics|stats|newsletter)/i', $hook);
+    }
+
+    private function batch_priority_summary(array $payloads): string
+    {
+        $parts = [];
+        foreach ($payloads as $payload) {
+            $parts[] = sprintf('%s=%d/%s', $payload->hook, $this->payload_priority_rank($payload), $payload->source_metadata());
+        }
+
+        return implode(', ', array_slice($parts, 0, 5)) . (count($parts) > 5 ? ', ...' : '');
     }
 
     private function action_scheduler_lane_for(Job_Payload $payload): string
