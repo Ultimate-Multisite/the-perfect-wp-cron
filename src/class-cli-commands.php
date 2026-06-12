@@ -46,14 +46,48 @@ class CLI_Commands
             ));
         }
 
-        if (!empty($data['pending_as_lanes'])) {
+        if (!empty($data['pending_by_source']) && is_array($data['pending_by_source'])) {
+            WP_CLI::log('  Pending timers by source:');
+            foreach ($data['pending_by_source'] as $source => $count) {
+                WP_CLI::log(sprintf('    - %s: %d', $source, $count));
+            }
+        }
+
+        if (!empty($data['pending_by_hook']) && is_array($data['pending_by_hook'])) {
+            WP_CLI::log('  Pending timers by hook:');
+            $hooks = array_slice($data['pending_by_hook'], 0, 10, true);
+            foreach ($hooks as $hook => $count) {
+                WP_CLI::log(sprintf('    - %s: %d', $hook, $count));
+            }
+
+            $remaining = count($data['pending_by_hook']) - count($hooks);
+            if ($remaining > 0) {
+                WP_CLI::log(sprintf('    - ... %d more hooks', $remaining));
+            }
+        }
+
+        if (!empty($data['as_lanes']) && is_array($data['as_lanes'])) {
+            WP_CLI::log('  AS lanes:');
+            foreach ($data['as_lanes'] as $lane => $details) {
+                WP_CLI::log(sprintf(
+                    '    - %s: pending %d, running %d, max %d, batch %d',
+                    $lane,
+                    (int) ($details['pending'] ?? 0),
+                    (int) ($details['running'] ?? 0),
+                    (int) ($details['max'] ?? 0),
+                    (int) ($details['batch'] ?? 0)
+                ));
+            }
+        }
+
+        if (empty($data['as_lanes']) && !empty($data['pending_as_lanes'])) {
             WP_CLI::log('  Pending AS lanes:');
             foreach ($data['pending_as_lanes'] as $lane => $count) {
                 WP_CLI::log(sprintf('    - %s: %d', $lane, $count));
             }
         }
 
-        if (!empty($data['running_as_lanes'])) {
+        if (empty($data['as_lanes']) && !empty($data['running_as_lanes'])) {
             WP_CLI::log('  Running AS lanes:');
             foreach ($data['running_as_lanes'] as $lane => $count) {
                 WP_CLI::log(sprintf('    - %s: %d', $lane, $count));
