@@ -52,6 +52,10 @@ class Worker_Process
 
     private int $running_jobs = 0;
     private int $start_time;
+    private bool $is_rescanning = false;
+    private int $last_rescan_started = 0;
+    private int $last_rescan_finished = 0;
+    private int $last_rescan_duration = 0;
 
     public function __construct(string $wp_load, string $primary_domain, string $execute_script, string $scan_script = '')
     {
@@ -102,15 +106,26 @@ class Worker_Process
         // Subprocess polling timer — every 0.5 seconds
         Timer::add(0.5, fn() => $this->poll_processes($worker_id));
 
-        // Initial DB scan
-        Worker::log(sprintf('[W%d] Scanning database for pending jobs...', $worker_id));
-        $this->rescan_all_jobs();
-        Worker::log(sprintf('[W%d] Loaded %d pending jobs.', $worker_id, count($this->pending_timers)));
+        // Initial DB scan. Only one coordinator worker performs the expensive
+        // full-network scan so large multisite networks do not block every
+        // event loop child at startup.
+        if ($this->is_rescan_coordinator($worker_id)) {
+            Worker::log(sprintf('[W%d] Scanning database for pending jobs...', $worker_id));
+            $this->run_full_rescan($worker_id);
+            Worker::log(sprintf('[W%d] Loaded %d pending jobs.', $worker_id, count($this->pending_timers)));
+        } else {
+            Worker::log(sprintf('[W%d] Skipping full-network scan; worker 0 is rescan coordinator.', $worker_id));
+        }
 
-        // Periodic rescan timer (staggered by worker ID)
+        // Periodic full-network rescan. Keep it on the coordinator worker only
+        // so status commands and urgent Action Scheduler notifications can be
+        // handled by other children while WP-Cron backlogs are being scanned.
         Timer::add($this->rescan_interval, function () use ($worker_id) {
+            if (!$this->is_rescan_coordinator($worker_id)) {
+                return;
+            }
             Worker::log(sprintf('[W%d][RESCAN] %d timers pending, rescanning...', $worker_id, count($this->pending_timers)));
-            $this->rescan_all_jobs();
+            $this->run_full_rescan($worker_id);
         });
 
         // Action Scheduler can miss instant socket notification when an action
@@ -584,6 +599,30 @@ class Worker_Process
         }
     }
 
+    private function is_rescan_coordinator(int $worker_id): bool
+    {
+        return $worker_id === 0;
+    }
+
+    private function run_full_rescan(int $worker_id): void
+    {
+        if ($this->is_rescanning) {
+            Worker::log(sprintf('[W%d][RESCAN] Previous full-network rescan still running; skipping overlap.', $worker_id));
+            return;
+        }
+
+        $this->is_rescanning = true;
+        $this->last_rescan_started = time();
+
+        try {
+            $this->rescan_all_jobs();
+        } finally {
+            $this->last_rescan_finished = time();
+            $this->last_rescan_duration = max(0, $this->last_rescan_finished - $this->last_rescan_started);
+            $this->is_rescanning = false;
+        }
+    }
+
     /**
      * Load sovereign tenant entries from the generated multi-tenancy registry.
      *
@@ -812,8 +851,14 @@ class Worker_Process
                     'pending_as_lanes' => $this->pending_action_scheduler_counts(),
                     'memory'          => sprintf('%.1f MB', $mem_mb),
                     'running_details' => $running_details,
+                    'rescan'          => [
+                        'in_progress' => $this->is_rescanning,
+                        'last_started' => $this->last_rescan_started,
+                        'last_finished' => $this->last_rescan_finished,
+                        'last_duration' => $this->last_rescan_duration,
+                    ],
                 ]);
-                $connection->send($response);
+                $connection->close($response . "\n");
                 break;
 
             case 'restart':
