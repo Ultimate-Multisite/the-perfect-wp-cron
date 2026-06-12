@@ -330,7 +330,8 @@ class Worker_Process
     {
         $this->flush_action_scheduler_batches();
 
-        foreach ($this->pending_batch as $site_id => $payloads) {
+        foreach ($this->ordered_site_ids_by_priority($this->pending_batch) as $site_id) {
+            $payloads = $this->pending_batch[$site_id] ?? [];
             if (empty($payloads)) {
                 unset($this->pending_batch[$site_id]);
                 continue;
@@ -358,8 +359,8 @@ class Worker_Process
                 continue;
             }
 
-            $site_batches = $this->pending_as_batch[$lane];
-            foreach ($site_batches as $site_id => $payloads) {
+            foreach ($this->ordered_site_ids_by_priority($this->pending_as_batch[$lane]) as $site_id) {
+                $payloads = $this->pending_as_batch[$lane][$site_id] ?? [];
                 if (empty($payloads)) {
                     unset($this->pending_as_batch[$lane][$site_id]);
                     continue;
@@ -398,6 +399,44 @@ class Worker_Process
         }
 
         return $ordered;
+    }
+
+    private function ordered_site_ids_by_priority(array $site_batches): array
+    {
+        $site_ids = array_keys($site_batches);
+        usort($site_ids, function (int $left, int $right) use ($site_batches): int {
+            $left_payload = $this->highest_priority_payload($site_batches[$left] ?? []);
+            $right_payload = $this->highest_priority_payload($site_batches[$right] ?? []);
+
+            if ($left_payload === null || $right_payload === null) {
+                return ($left_payload === null) <=> ($right_payload === null);
+            }
+
+            $rank = $this->payload_priority_rank($left_payload) <=> $this->payload_priority_rank($right_payload);
+            if ($rank !== 0) {
+                return $rank;
+            }
+
+            $timestamp = $left_payload->timestamp <=> $right_payload->timestamp;
+            if ($timestamp !== 0) {
+                return $timestamp;
+            }
+
+            return $left <=> $right;
+        });
+
+        return $site_ids;
+    }
+
+    private function highest_priority_payload(array $payloads): ?Job_Payload
+    {
+        if (empty($payloads)) {
+            return null;
+        }
+
+        $this->sort_payloads_by_priority($payloads);
+
+        return $payloads[0];
     }
 
     private function sort_payloads_by_priority(array &$payloads): void
