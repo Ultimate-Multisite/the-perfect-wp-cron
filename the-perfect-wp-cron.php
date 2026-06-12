@@ -31,6 +31,7 @@ if (defined('QUEUE_WORKER_RUNNING') && QUEUE_WORKER_RUNNING) {
 }
 
 add_action('init', ['QueueWorker\\Cron_Interceptor', 'register']);
+QueueWorker\Action_Scheduler_Bridge::register_stored_action_hook();
 add_action('action_scheduler_init', ['QueueWorker\\Action_Scheduler_Bridge', 'register']);
 
 // Admin menu
