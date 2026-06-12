@@ -21,11 +21,42 @@ class Socket_Client
         $path = self::get_socket_path();
         $socket = @stream_socket_client('unix://' . $path, $errno, $errstr, 1);
         if (!$socket) {
+            self::log_notify_failure($payload, sprintf(
+                'connect failed for %s: [%d] %s',
+                $path,
+                (int) $errno,
+                $errstr !== '' ? $errstr : 'unknown error'
+            ));
             return false;
         }
-        fwrite($socket, $payload->to_json() . "\n");
+
+        $message = $payload->to_json() . "\n";
+        $written = fwrite($socket, $message);
         fclose($socket);
+
+        if ($written !== strlen($message)) {
+            self::log_notify_failure($payload, sprintf(
+                'write failed for %s: wrote %d of %d bytes',
+                $path,
+                $written === false ? 0 : $written,
+                strlen($message)
+            ));
+            return false;
+        }
+
         return true;
+    }
+
+    private static function log_notify_failure(Job_Payload $payload, string $reason): void
+    {
+        error_log(sprintf(
+            '[The Perfect WP Cron][Socket Notify Failed] source=%s site_id=%d hook=%s action_id=%d reason=%s',
+            $payload->source,
+            $payload->site_id,
+            $payload->hook,
+            $payload->action_id,
+            $reason
+        ));
     }
 
     public static function send_command(string $command, int $timeout = 5): ?array
