@@ -51,6 +51,7 @@ if (!class_exists('QueueWorker\\Config')) {
 }
 
 use QueueWorker\Bootstrap;
+use QueueWorker\Cron_Event_Filter;
 use QueueWorker\Job_Payload;
 
 $site_root = $site_autoload ? dirname($site_autoload, 2) : dirname(__DIR__);
@@ -84,14 +85,6 @@ if (!$is_sovereign_tenant && $site_id !== get_current_blog_id()) {
 wp_cache_delete('cron', 'options');
 wp_cache_delete('alloptions', 'options');
 
-$bypass_hooks = [
-    'wp_version_check',
-    'wp_update_plugins',
-    'wp_update_themes',
-    'action_scheduler_run_queue',
-    'action_scheduler_run_cleanup',
-];
-
 $payloads = [];
 $crons = _get_cron_array();
 if (is_array($crons)) {
@@ -101,7 +94,7 @@ if (is_array($crons)) {
             continue;
         }
         foreach ($hooks as $hook => $events) {
-            if (in_array($hook, $bypass_hooks, true)) {
+            if (Cron_Event_Filter::should_bypass($hook)) {
                 continue;
             }
             foreach ($events as $event) {

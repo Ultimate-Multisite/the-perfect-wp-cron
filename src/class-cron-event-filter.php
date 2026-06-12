@@ -4,17 +4,9 @@ namespace QueueWorker;
 
 class Cron_Event_Filter
 {
-    private const BYPASS_HOOKS = [
-        'wp_version_check',
-        'wp_update_plugins',
-        'wp_update_themes',
-        'action_scheduler_run_queue',
-        'action_scheduler_run_cleanup',
-    ];
-
     public static function should_bypass(string $hook): bool
     {
-        return in_array($hook, self::BYPASS_HOOKS, true);
+        return in_array($hook, Config::bypass_cron_hooks(), true);
     }
 
     public static function signature(string $hook, array $event, int $timestamp): string
