@@ -4,14 +4,6 @@ namespace QueueWorker;
 
 class Cron_Interceptor
 {
-    private static array $bypass_hooks = [
-        'wp_version_check',
-        'wp_update_plugins',
-        'wp_update_themes',
-        'action_scheduler_run_queue',
-        'action_scheduler_run_cleanup',
-    ];
-
     public static function register(): void
     {
         add_action('schedule_event', [__CLASS__, 'on_schedule_event']);
@@ -23,7 +15,7 @@ class Cron_Interceptor
             return;
         }
 
-        if (in_array($event->hook, self::$bypass_hooks, true)) {
+        if (Cron_Event_Filter::should_bypass($event->hook)) {
             return;
         }
 

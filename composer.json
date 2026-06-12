@@ -20,6 +20,9 @@
       "src/class-job-list-table.php"
     ]
   },
+  "scripts": {
+    "test:regression": "php tests/regression.php"
+  },
   "config": {
     "optimize-autoloader": true,
     "classmap-authoritative": true,
