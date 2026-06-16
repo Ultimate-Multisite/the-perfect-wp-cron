@@ -64,6 +64,7 @@ namespace {
 namespace {
     use QueueWorker\Config;
     use QueueWorker\Cron_Event_Filter;
+    use QueueWorker\Cron_Interceptor;
     use QueueWorker\Job_Payload;
     use QueueWorker\Worker_Process;
 
@@ -71,6 +72,8 @@ namespace {
 
     $GLOBALS['test_crons'] = [];
     $GLOBALS['test_current_blog_id'] = 1;
+    $GLOBALS['test_filters'] = [];
+    $GLOBALS['test_actions'] = [];
     $GLOBALS['test_switched_blogs'] = [];
     $GLOBALS['test_unscheduled_events'] = [];
 
@@ -144,6 +147,22 @@ namespace {
     {
     }
 
+    function add_filter(string $hook_name, callable $callback): void
+    {
+        $GLOBALS['test_filters'][] = [
+            'hook'     => $hook_name,
+            'callback' => $callback,
+        ];
+    }
+
+    function add_action(string $hook_name, callable $callback): void
+    {
+        $GLOBALS['test_actions'][] = [
+            'hook'     => $hook_name,
+            'callback' => $callback,
+        ];
+    }
+
     function _get_cron_array(): array
     {
         return $GLOBALS['test_crons'];
@@ -192,6 +211,7 @@ namespace {
 
     require_once __DIR__ . '/../src/class-config.php';
     require_once __DIR__ . '/../src/class-cron-event-filter.php';
+    require_once __DIR__ . '/../src/class-cron-interceptor.php';
     require_once __DIR__ . '/../src/class-cli-commands.php';
     require_once __DIR__ . '/../src/class-job-payload.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
@@ -247,6 +267,15 @@ namespace {
     assert_true(Cron_Event_Filter::should_bypass('custom_hook'), 'Configured bypass hook must be skipped by shared cron filter');
     assert_true(Cron_Event_Filter::should_bypass('extra_hook'), 'Comma-separated bypass hooks must be normalized');
     putenv('QUEUE_WORKER_BYPASS_CRON_HOOKS');
+
+    Cron_Interceptor::register();
+    assert_same([], $GLOBALS['test_actions'], 'Cron interceptor must register schedule_event as a filter, not an action');
+    assert_same('schedule_event', $GLOBALS['test_filters'][0]['hook'] ?? '', 'Cron interceptor must hook schedule_event');
+    assert_same([Cron_Interceptor::class, 'on_schedule_event'], $GLOBALS['test_filters'][0]['callback'] ?? null, 'Cron interceptor must register its event callback');
+    $event = (object) ['hook' => 'wp_update_plugins'];
+    assert_same($event, Cron_Interceptor::on_schedule_event($event), 'Cron interceptor filter must return the event unchanged');
+    assert_same(null, Cron_Interceptor::on_schedule_event(null), 'Cron interceptor filter must preserve invalid event values');
+
     assert_same(
         Cron_Event_Filter::signature('custom_hook', ['schedule' => 'hourly', 'args' => ['a' => 1]], 100),
         Cron_Event_Filter::signature('custom_hook', ['schedule' => 'hourly', 'args' => ['a' => 1]], 200),
