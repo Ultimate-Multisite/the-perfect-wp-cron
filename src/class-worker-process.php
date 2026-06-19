@@ -209,7 +209,10 @@ class Worker_Process
         if (isset($this->pending_timers[$key])) {
             return;
         }
-        $delay = max(0, $payload->timestamp - time());
+        // Workerman timers must use a positive interval. Due or overdue
+        // payloads still need to run immediately, so schedule them on the next
+        // event-loop tick instead of passing 0 to Timer::add().
+        $delay = max(0.001, $payload->timestamp - time());
         $timer_id = Timer::add($delay, fn($p) => $this->execute_job($p), [$payload], false);
         $this->pending_timers[$key] = $timer_id;
         $this->pending_timer_payloads[$key] = $payload;

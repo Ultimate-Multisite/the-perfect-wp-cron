@@ -17,9 +17,12 @@ namespace Workerman {
     class Timer
     {
         public static int $next_id = 1;
+        public static array $delays = [];
 
         public static function add($delay, callable $callback, array $args = [], bool $persistent = true): int
         {
+            self::$delays[] = $delay;
+
             return self::$next_id++;
         }
     }
@@ -251,6 +254,19 @@ namespace {
         'source' => 'action_scheduler',
         'group' => 'checkout',
     ])]), 'AS lane must not match when hook differs');
+
+    \Workerman\Timer::$delays = [];
+    invoke_private($worker, 'schedule_timer', [new Job_Payload([
+        'site_id' => 7,
+        'site_url' => 'https://tenant.example.test',
+        'hook' => 'due_as_hook',
+        'args' => [],
+        'timestamp' => time() - 10,
+        'source' => 'action_scheduler',
+        'action_id' => 45,
+        'group' => 'checkout',
+    ])]);
+    assert_same(0.001, \Workerman\Timer::$delays[0] ?? null, 'Due Action Scheduler payloads must use a positive near-immediate timer delay');
 
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL');
     assert_same(5, Config::action_scheduler_rescan_interval(), 'AS rescan interval must default to five seconds');
