@@ -79,6 +79,7 @@ namespace {
     $GLOBALS['test_actions'] = [];
     $GLOBALS['test_switched_blogs'] = [];
     $GLOBALS['test_unscheduled_events'] = [];
+    $GLOBALS['test_ms_switched'] = false;
 
     class Test_WPDB
     {
@@ -123,6 +124,11 @@ namespace {
         return false;
     }
 
+    function ms_is_switched(): bool
+    {
+        return (bool) $GLOBALS['test_ms_switched'];
+    }
+
     function wp_get_schedules(): array
     {
         return [
@@ -139,11 +145,13 @@ namespace {
     {
         $GLOBALS['test_current_blog_id'] = $site_id;
         $GLOBALS['test_switched_blogs'][] = $site_id;
+        $GLOBALS['test_ms_switched'] = true;
     }
 
     function restore_current_blog(): void
     {
         $GLOBALS['test_current_blog_id'] = 1;
+        $GLOBALS['test_ms_switched'] = false;
     }
 
     function wp_cache_delete(string $key, string $group): void
@@ -256,6 +264,31 @@ namespace {
     ])]), 'AS lane must not match when hook differs');
 
     \Workerman\Timer::$delays = [];
+    $registry_content_dir = sys_get_temp_dir() . '/qw-regression-content-' . getmypid();
+    if (!is_dir($registry_content_dir)) {
+        assert_true(mkdir($registry_content_dir, 0777, true), 'Registry fixture directory must be created');
+    }
+    if (!defined('WP_CONTENT_DIR')) {
+        define('WP_CONTENT_DIR', $registry_content_dir);
+    }
+    assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/site-registry.data.json', json_encode([
+        'domain_index' => [
+            'example.test' => 7,
+        ],
+    ])), 'Registry fixture must be writable');
+    $GLOBALS['test_current_blog_id'] = 49;
+    $GLOBALS['test_ms_switched'] = true;
+    $switched_payload = new Job_Payload([
+        'hook' => 'switched_site_hook',
+        'args' => [],
+        'timestamp' => 1710000000,
+        'source' => 'action_scheduler',
+        'action_id' => 46,
+        'group' => 'translate',
+    ]);
+    assert_same(49, $switched_payload->site_id, 'Payload site ID must follow the switched blog during network scans');
+    restore_current_blog();
+
     invoke_private($worker, 'schedule_timer', [new Job_Payload([
         'site_id' => 7,
         'site_url' => 'https://tenant.example.test',
