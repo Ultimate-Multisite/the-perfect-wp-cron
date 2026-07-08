@@ -264,6 +264,18 @@ namespace {
     ])]), 'AS lane must not match when hook differs');
 
     \Workerman\Timer::$delays = [];
+    $registry_content_dir = sys_get_temp_dir() . '/qw-regression-content-' . getmypid();
+    if (!is_dir($registry_content_dir)) {
+        assert_true(mkdir($registry_content_dir, 0777, true), 'Registry fixture directory must be created');
+    }
+    if (!defined('WP_CONTENT_DIR')) {
+        define('WP_CONTENT_DIR', $registry_content_dir);
+    }
+    assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/site-registry.data.json', json_encode([
+        'domain_index' => [
+            'example.test' => 7,
+        ],
+    ])), 'Registry fixture must be writable');
     $GLOBALS['test_current_blog_id'] = 49;
     $GLOBALS['test_ms_switched'] = true;
     $switched_payload = new Job_Payload([
