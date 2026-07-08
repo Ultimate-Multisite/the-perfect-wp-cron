@@ -150,6 +150,10 @@ class Job_Payload
             return (int) WU_MT_SOVEREIGN_TENANT;
         }
 
+        if (function_exists('ms_is_switched') && ms_is_switched()) {
+            return get_current_blog_id();
+        }
+
         $host = strtolower(trim((string) ($_SERVER['HTTP_HOST'] ?? '')));
         if ($host !== '' && defined('WP_CONTENT_DIR')) {
             $path = WP_CONTENT_DIR . '/site-registry.data.json';
