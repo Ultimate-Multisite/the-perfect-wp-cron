@@ -276,6 +276,15 @@ namespace {
             'example.test' => 7,
         ],
     ])), 'Registry fixture must be writable');
+    $registry_payload = new Job_Payload([
+        'hook' => 'registry_site_hook',
+        'args' => [],
+        'timestamp' => 1710000000,
+        'source' => 'action_scheduler',
+        'action_id' => 47,
+        'group' => 'translate',
+    ]);
+    assert_same(7, $registry_payload->site_id, 'Payload site ID must use the registry lookup when not switched');
     $GLOBALS['test_current_blog_id'] = 49;
     $GLOBALS['test_ms_switched'] = true;
     $switched_payload = new Job_Payload([
