@@ -96,15 +96,101 @@ class Job_Executor
         $args      = $job['args'] ?? [];
         $schedule  = $job['schedule'] ?? '';
 
+        // The long-running worker can hold stale one-shot payloads after a job
+        // was already removed by another worker, deploy, or native cron pass.
+        // Re-read the cron option and only fire callbacks that still exist in
+        // WordPress' cron array. This prevents duplicate email/report jobs when
+        // an old payload is re-scanned or re-claimed after the short lock TTL.
+        $this->flush_cron_option_cache();
+        $crons = _get_cron_array();
+        if ($this->find_cron_event_key($crons, $timestamp, $hook, $args) === null) {
+            return;
+        }
+
         // Reschedule recurring events before firing (mirrors wp-cron.php behavior).
         // Without this, the event is simply deleted and plugins re-register it
         // at time() on next load, causing an infinite rapid-fire loop.
         if ($schedule !== '') {
-            wp_reschedule_event($timestamp, $schedule, $hook, $args);
+            $rescheduled = wp_reschedule_event($timestamp, $schedule, $hook, $args);
+
+            if ($rescheduled === false) {
+                throw new \RuntimeException(sprintf('Failed to reschedule cron event %s at %d', $hook, $timestamp));
+            }
         }
 
-        wp_unschedule_event($timestamp, $hook, $args);
+        $unscheduled = $this->unschedule_cron_event($timestamp, $hook, $args);
+
+        if (!$unscheduled) {
+            throw new \RuntimeException(sprintf('Failed to unschedule cron event %s at %d', $hook, $timestamp));
+        }
+
         do_action_ref_array($hook, $args);
+    }
+
+    private function flush_cron_option_cache(): void
+    {
+        if (!function_exists('wp_cache_delete')) {
+            return;
+        }
+
+        wp_cache_delete('cron', 'options');
+        wp_cache_delete('alloptions', 'options');
+    }
+
+    private function unschedule_cron_event(int $timestamp, string $hook, array $args): bool
+    {
+        $unscheduled = wp_unschedule_event($timestamp, $hook, $args);
+
+        if ($unscheduled !== false) {
+            return true;
+        }
+
+        // Some cron arrays can contain malformed event keys that do not match
+        // WordPress' md5( serialize( $args ) ) convention. In that state
+        // wp_unschedule_event() cannot remove the row even though the event is
+        // present, so remove the matching hook/args manually before firing.
+        $crons = _get_cron_array();
+        $key = $this->find_cron_event_key($crons, $timestamp, $hook, $args);
+
+        if ($key === null) {
+            return false;
+        }
+
+        unset($crons[$timestamp][$hook][$key]);
+
+        if (empty($crons[$timestamp][$hook])) {
+            unset($crons[$timestamp][$hook]);
+        }
+
+        if (empty($crons[$timestamp])) {
+            unset($crons[$timestamp]);
+        }
+
+        return _set_cron_array($crons) !== false;
+    }
+
+    private function find_cron_event_key($crons, int $timestamp, string $hook, array $args): ?string
+    {
+        if ($timestamp < 1 || $hook === '') {
+            return null;
+        }
+
+        if (!is_array($crons) || empty($crons[$timestamp][$hook]) || !is_array($crons[$timestamp][$hook])) {
+            return null;
+        }
+
+        $key = md5(serialize($args));
+        if (isset($crons[$timestamp][$hook][$key])) {
+            return $key;
+        }
+
+        foreach ($crons[$timestamp][$hook] as $event_key => $event) {
+            if (($event['args'] ?? []) === $args) {
+                return (string) $event_key;
+            }
+        }
+
+        return null;
     }
 
     private function execute_action_scheduler(array $job): void

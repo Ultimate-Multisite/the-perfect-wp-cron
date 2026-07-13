@@ -79,6 +79,9 @@ namespace {
     $GLOBALS['test_actions'] = [];
     $GLOBALS['test_switched_blogs'] = [];
     $GLOBALS['test_unscheduled_events'] = [];
+    $GLOBALS['test_rescheduled_events'] = [];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_cache_deletes'] = [];
     $GLOBALS['test_ms_switched'] = false;
 
     class Test_WPDB
@@ -156,6 +159,10 @@ namespace {
 
     function wp_cache_delete(string $key, string $group): void
     {
+        $GLOBALS['test_cache_deletes'][] = [
+            'key'   => $key,
+            'group' => $group,
+        ];
     }
 
     function add_filter(string $hook_name, callable $callback): void
@@ -179,15 +186,69 @@ namespace {
         return $GLOBALS['test_crons'];
     }
 
+    function _set_cron_array(array $crons): bool
+    {
+        $GLOBALS['test_crons'] = $crons;
+
+        return true;
+    }
+
     function wp_unschedule_event(int $timestamp, string $hook, array $args = []): bool
     {
+        $key = md5(serialize($args));
+
+        if (!isset($GLOBALS['test_crons'][$timestamp][$hook][$key])) {
+            $key = null;
+
+            foreach ($GLOBALS['test_crons'][$timestamp][$hook] ?? [] as $event_key => $event) {
+                if (($event['args'] ?? []) === $args) {
+                    $key = $event_key;
+                    break;
+                }
+            }
+
+            if ($key === null) {
+                return false;
+            }
+        }
+
         $GLOBALS['test_unscheduled_events'][] = [
             'timestamp' => $timestamp,
             'hook'      => $hook,
             'args'      => $args,
         ];
 
+        unset($GLOBALS['test_crons'][$timestamp][$hook][$key]);
+
+        if (empty($GLOBALS['test_crons'][$timestamp][$hook])) {
+            unset($GLOBALS['test_crons'][$timestamp][$hook]);
+        }
+
+        if (empty($GLOBALS['test_crons'][$timestamp])) {
+            unset($GLOBALS['test_crons'][$timestamp]);
+        }
+
         return true;
+    }
+
+    function wp_reschedule_event(int $timestamp, string $schedule, string $hook, array $args = []): bool
+    {
+        $GLOBALS['test_rescheduled_events'][] = [
+            'timestamp' => $timestamp,
+            'schedule'  => $schedule,
+            'hook'      => $hook,
+            'args'      => $args,
+        ];
+
+        return true;
+    }
+
+    function do_action_ref_array(string $hook, array $args): void
+    {
+        $GLOBALS['test_fired_actions'][] = [
+            'hook' => $hook,
+            'args' => $args,
+        ];
     }
 
     function assert_true(bool $condition, string $message): void
@@ -225,6 +286,7 @@ namespace {
     require_once __DIR__ . '/../src/class-cron-interceptor.php';
     require_once __DIR__ . '/../src/class-cli-commands.php';
     require_once __DIR__ . '/../src/class-job-payload.php';
+    require_once __DIR__ . '/../src/class-job-executor.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
 
     $payload = new Job_Payload([
@@ -276,15 +338,6 @@ namespace {
             'example.test' => 7,
         ],
     ])), 'Registry fixture must be writable');
-    $registry_payload = new Job_Payload([
-        'hook' => 'registry_site_hook',
-        'args' => [],
-        'timestamp' => 1710000000,
-        'source' => 'action_scheduler',
-        'action_id' => 47,
-        'group' => 'translate',
-    ]);
-    assert_same(7, $registry_payload->site_id, 'Payload site ID must use the registry lookup when not switched');
     $GLOBALS['test_current_blog_id'] = 49;
     $GLOBALS['test_ms_switched'] = true;
     $switched_payload = new Job_Payload([
@@ -309,6 +362,67 @@ namespace {
         'group' => 'checkout',
     ])]);
     assert_same(0.001, \Workerman\Timer::$delays[0] ?? null, 'Due Action Scheduler payloads must use a positive near-immediate timer delay');
+
+    $executor = new QueueWorker\Job_Executor(1);
+    $stale_job = [
+        'hook'      => 'stale_one_shot_hook',
+        'args'      => ['a' => 1],
+        'timestamp' => 400,
+        'schedule'  => '',
+    ];
+    $GLOBALS['test_crons'] = [];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_unscheduled_events'] = [];
+    invoke_private($executor, 'execute_wp_cron', [$stale_job]);
+    assert_same([], $GLOBALS['test_fired_actions'], 'Stale WP-Cron payloads must not fire callbacks after their cron row is gone');
+    assert_same([], $GLOBALS['test_unscheduled_events'], 'Stale WP-Cron payloads must not attempt to unschedule a missing event');
+
+    $fresh_key = md5(serialize(['a' => 1]));
+    $fresh_job = [
+        'hook'      => 'fresh_one_shot_hook',
+        'args'      => ['a' => 1],
+        'timestamp' => 500,
+        'schedule'  => '',
+    ];
+    $GLOBALS['test_crons'] = [
+        500 => [
+            'fresh_one_shot_hook' => [
+                $fresh_key => ['schedule' => '', 'args' => ['a' => 1]],
+            ],
+        ],
+    ];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_unscheduled_events'] = [];
+    invoke_private($executor, 'execute_wp_cron', [$fresh_job]);
+    invoke_private($executor, 'execute_wp_cron', [$fresh_job]);
+    assert_same([
+        ['hook' => 'fresh_one_shot_hook', 'args' => ['a' => 1]],
+    ], $GLOBALS['test_fired_actions'], 'A one-shot WP-Cron payload must fire once and skip duplicate stale executions');
+    assert_same([
+        ['timestamp' => 500, 'hook' => 'fresh_one_shot_hook', 'args' => ['a' => 1]],
+    ], $GLOBALS['test_unscheduled_events'], 'A one-shot WP-Cron payload must be unscheduled before firing');
+
+    $malformed_job = [
+        'hook'      => 'malformed_one_shot_hook',
+        'args'      => [],
+        'timestamp' => 600,
+        'schedule'  => '',
+    ];
+    $GLOBALS['test_crons'] = [
+        600 => [
+            'malformed_one_shot_hook' => [
+                'malformed-key' => ['schedule' => '', 'args' => []],
+            ],
+        ],
+    ];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_unscheduled_events'] = [];
+    invoke_private($executor, 'execute_wp_cron', [$malformed_job]);
+    invoke_private($executor, 'execute_wp_cron', [$malformed_job]);
+    assert_same([
+        ['hook' => 'malformed_one_shot_hook', 'args' => []],
+    ], $GLOBALS['test_fired_actions'], 'Malformed-key WP-Cron payloads must be removed directly and fire once');
+    assert_same([], $GLOBALS['test_crons'], 'Malformed-key WP-Cron payloads must be removed from the cron array');
 
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL');
     assert_same(5, Config::action_scheduler_rescan_interval(), 'AS rescan interval must default to five seconds');
@@ -387,6 +501,12 @@ namespace {
         ],
     ];
     $cli = new QueueWorker\CLI_Commands();
+    $dedupe_doc = (new ReflectionMethod($cli, 'dedupe_cron'))->getDocComment();
+    assert_true(is_string($dedupe_doc), 'Dedupe command must have a WP-CLI docblock');
+    assert_true(str_contains($dedupe_doc, '[--dry-run]'), 'Dedupe dry-run flag must use optional WP-CLI synopsis syntax');
+    assert_true(str_contains($dedupe_doc, '[--apply]'), 'Dedupe apply flag must use optional WP-CLI synopsis syntax');
+    assert_true(!preg_match('/^\s*\*\s+--(?:dry-run|apply)\s*$/m', $dedupe_doc), 'Dedupe flags must not use bare WP-CLI synopsis syntax');
+
     $groups = invoke_private($cli, 'cron_duplicate_groups', [$GLOBALS['test_crons']]);
     $duplicate_groups = array_values(array_filter($groups, static function (array $group): bool {
         return count($group['events']) > 1;

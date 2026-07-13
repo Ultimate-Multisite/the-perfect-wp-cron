@@ -224,10 +224,10 @@ class CLI_Commands
      *
      * ## OPTIONS
      *
-     * --dry-run
+     * [--dry-run]
      * : Report duplicate groups without modifying cron options.
      *
-     * --apply
+     * [--apply]
      * : Remove later duplicate events with wp_unschedule_event().
      *
      * ## EXAMPLES
