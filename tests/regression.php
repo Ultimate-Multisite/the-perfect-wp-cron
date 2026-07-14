@@ -535,6 +535,7 @@ namespace {
             ],
         ],
     ];
+    $duplicate_crons = $GLOBALS['test_crons'];
     $cli = new QueueWorker\CLI_Commands();
     $dedupe_doc = (new ReflectionMethod($cli, 'dedupe_cron'))->getDocComment();
     assert_true(is_string($dedupe_doc), 'Dedupe command must have a WP-CLI docblock');
@@ -542,6 +543,20 @@ namespace {
     assert_true(str_contains($dedupe_doc, '[--apply]'), 'Dedupe apply flag must use optional WP-CLI synopsis syntax');
     assert_true(!preg_match('/^\s*\*\s+--(?:dry-run|apply)\s*$/m', $dedupe_doc), 'Dedupe flags must not use bare WP-CLI synopsis syntax');
 
+    $GLOBALS['test_crons'] = [
+        100 => [
+            'single_recurring_hook' => [
+                'only' => ['schedule' => 'hourly', 'args' => []],
+            ],
+        ],
+    ];
+    assert_same(
+        ['groups' => 0, 'retained' => 0, 'removed' => 0, 'rows' => []],
+        invoke_private($cli, 'cron_dedupe_site_report', [1, true]),
+        'Apply must not write unchanged cron arrays when no duplicates exist'
+    );
+
+    $GLOBALS['test_crons'] = $duplicate_crons;
     $groups = invoke_private($cli, 'cron_duplicate_groups', [$GLOBALS['test_crons']]);
     $duplicate_groups = array_values(array_filter($groups, static function (array $group): bool {
         return count($group['events']) > 1;
