@@ -103,7 +103,8 @@ class Job_Executor
         // an old payload is re-scanned or re-claimed after the short lock TTL.
         $this->flush_cron_option_cache();
         $crons = _get_cron_array();
-        if ($this->find_cron_event_key($crons, $timestamp, $hook, $args) === null) {
+        $event_key = $this->find_cron_event_key($crons, $timestamp, $hook, $args);
+        if ($event_key === null) {
             return;
         }
 
@@ -111,10 +112,23 @@ class Job_Executor
         // Without this, the event is simply deleted and plugins re-register it
         // at time() on next load, causing an infinite rapid-fire loop.
         if ($schedule !== '') {
-            $rescheduled = wp_reschedule_event($timestamp, $schedule, $hook, $args);
+            // A previous attempt can have successfully created the next
+            // occurrence but stopped before removing this stale row. WordPress
+            // then returns false because writing the identical next event is a
+            // no-op. Remove the stale duplicate without replaying its callback.
+            if ($this->recurring_successor_exists($crons, $timestamp, $hook, $args, $schedule, $event_key)) {
+                if (!$this->unschedule_cron_event($timestamp, $hook, $args)) {
+                    throw new \RuntimeException(sprintf('Failed to remove duplicate cron event %s at %d', $hook, $timestamp));
+                }
 
-            if ($rescheduled === false) {
-                throw new \RuntimeException(sprintf('Failed to reschedule cron event %s at %d', $hook, $timestamp));
+                return;
+            }
+
+            $rescheduled = wp_reschedule_event($timestamp, $schedule, $hook, $args, true);
+
+            if ($rescheduled !== true) {
+                $reason = is_wp_error($rescheduled) ? $rescheduled->get_error_message() : 'unknown error';
+                throw new \RuntimeException(sprintf('Failed to reschedule cron event %s at %d: %s', $hook, $timestamp, $reason));
             }
         }
 
@@ -167,6 +181,38 @@ class Job_Executor
         }
 
         return _set_cron_array($crons) !== false;
+    }
+
+    private function recurring_successor_exists(array $crons, int $timestamp, string $hook, array $args, string $schedule, string $event_key): bool
+    {
+        $event = $crons[$timestamp][$hook][$event_key] ?? null;
+        if (!is_array($event)) {
+            return false;
+        }
+
+        $interval = (int) ($event['interval'] ?? 0);
+        if ($interval < 1) {
+            $schedules = wp_get_schedules();
+            $interval = (int) ($schedules[$schedule]['interval'] ?? 0);
+        }
+
+        if ($interval < 1) {
+            return false;
+        }
+
+        $now = time();
+        $next_timestamp = $timestamp >= $now
+            ? $now + $interval
+            : $now + ($interval - (($now - $timestamp) % $interval));
+        $next_key = $this->find_cron_event_key($crons, $next_timestamp, $hook, $args);
+
+        if ($next_key === null) {
+            return false;
+        }
+
+        $next_event = $crons[$next_timestamp][$hook][$next_key] ?? null;
+
+        return is_array($next_event) && ($next_event['schedule'] ?? '') === $schedule;
     }
 
     private function find_cron_event_key($crons, int $timestamp, string $hook, array $args): ?string
