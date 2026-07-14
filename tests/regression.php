@@ -68,6 +68,7 @@ namespace {
     use QueueWorker\Config;
     use QueueWorker\Cron_Event_Filter;
     use QueueWorker\Cron_Interceptor;
+    use QueueWorker\Job_Log;
     use QueueWorker\Job_Payload;
     use QueueWorker\Worker_Process;
 
@@ -89,6 +90,8 @@ namespace {
     {
         public string $prefix = 'wp_';
         public string $base_prefix = 'wp_';
+        public array $queries = [];
+        public array $query_results = [];
 
         public function prepare(string $query, ...$args): string
         {
@@ -105,9 +108,11 @@ namespace {
             return null;
         }
 
-        public function query(string $query): int
+        public function query(string $query)
         {
-            return 1;
+            $this->queries[] = $query;
+
+            return $this->query_results === [] ? 1 : array_shift($this->query_results);
         }
     }
 
@@ -294,6 +299,7 @@ namespace {
     require_once __DIR__ . '/../src/class-cron-event-filter.php';
     require_once __DIR__ . '/../src/class-cron-interceptor.php';
     require_once __DIR__ . '/../src/class-cli-commands.php';
+    require_once __DIR__ . '/../src/class-job-log.php';
     require_once __DIR__ . '/../src/class-job-payload.php';
     require_once __DIR__ . '/../src/class-job-executor.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
@@ -572,6 +578,15 @@ namespace {
         ['timestamp' => 200, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
         ['timestamp' => 300, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
     ], $GLOBALS['test_unscheduled_events'], 'Apply must unschedule only later duplicate recurring events');
+
+    $GLOBALS['wpdb']->queries = [];
+    $GLOBALS['wpdb']->query_results = [10000, 10000, 23];
+    assert_same(20023, Job_Log::cleanup(7), 'Job log cleanup must report rows deleted across every batch');
+    assert_same(3, count($GLOBALS['wpdb']->queries), 'Job log cleanup must continue until a partial batch is deleted');
+    foreach ($GLOBALS['wpdb']->queries as $cleanup_query) {
+        assert_true(str_contains($cleanup_query, 'ORDER BY completed_at ASC'), 'Job log cleanup must delete the oldest rows first');
+        assert_true(str_contains($cleanup_query, 'LIMIT 10000'), 'Job log cleanup must bound each delete statement');
+    }
 
     echo "Regression tests passed.\n";
 }

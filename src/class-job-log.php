@@ -51,6 +51,7 @@ class Job_Log
         self::add_index_if_missing($table, 'lane', 'ALTER TABLE `' . $table . '` ADD KEY `lane` (`lane`)');
         self::add_index_if_missing($table, 'action_id', 'ALTER TABLE `' . $table . '` ADD KEY `action_id` (`action_id`)');
         self::add_index_if_missing($table, 'scheduled_at', 'ALTER TABLE `' . $table . '` ADD KEY `scheduled_at` (`scheduled_at`)');
+        self::add_index_if_missing($table, 'completed_at', 'ALTER TABLE `' . $table . '` ADD KEY `completed_at` (`completed_at`)');
     }
 
     private static function add_column_if_missing(string $table, string $column, string $alter_sql): void
@@ -249,7 +250,7 @@ class Job_Log
         ), ARRAY_A) ?: [];
     }
 
-    public static function cleanup(int $days = 0): int
+    public static function cleanup(int $days = 0, int $batch_size = 10000): int
     {
         global $wpdb;
         $table = self::table();
@@ -258,9 +259,27 @@ class Job_Log
             $days = Config::log_retention();
         }
 
-        return (int) $wpdb->query($wpdb->prepare(
-            "DELETE FROM `$table` WHERE completed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL %d DAY)",
-            $days
-        ));
+        $batch_size = max(1, $batch_size);
+        $total_deleted = 0;
+
+        do {
+            $deleted = $wpdb->query($wpdb->prepare(
+                "DELETE FROM `$table`
+                WHERE completed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL %d DAY)
+                ORDER BY completed_at ASC
+                LIMIT %d",
+                $days,
+                $batch_size
+            ));
+
+            if ($deleted === false) {
+                break;
+            }
+
+            $deleted = (int) $deleted;
+            $total_deleted += $deleted;
+        } while ($deleted === $batch_size);
+
+        return $total_deleted;
     }
 }
