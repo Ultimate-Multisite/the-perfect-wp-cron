@@ -219,8 +219,9 @@ class CLI_Commands
      * Duplicate recurring events can accumulate when long-running event-loop
      * execution, wp_reschedule_event(), backlog catch-up, and plugin bootstrap
      * scheduling all touch the same hook. This command groups events by site,
-     * hook, schedule, and args; keeps the earliest timestamp; and optionally
-     * removes later timestamps for identical recurring/event signatures.
+     * hook, schedule, and args; keeps the nearest future occurrence (or the
+     * newest overdue occurrence); and optionally removes all other rows for
+     * identical recurring/event signatures.
      *
      * ## OPTIONS
      *
@@ -228,7 +229,7 @@ class CLI_Commands
      * : Report duplicate groups without modifying cron options.
      *
      * [--apply]
-     * : Remove later duplicate events with wp_unschedule_event().
+     * : Remove duplicate events with wp_unschedule_event().
      *
      * ## EXAMPLES
      *
@@ -277,7 +278,7 @@ class CLI_Commands
         }
 
         WP_CLI::log($apply ? 'Duplicate WP-Cron cleanup applied.' : 'Duplicate WP-Cron dry-run report. No changes were made.');
-        WP_CLI::log('Grouping key: site_id + hook + schedule + args; earliest timestamp retained.');
+        WP_CLI::log('Grouping key: site_id + hook + schedule + args; nearest future or newest overdue timestamp retained.');
 
         if (!empty($rows)) {
             \WP_CLI\Utils\format_items('table', $rows, ['site_id', 'hook', 'schedule', 'duplicates', 'retained_timestamp', 'removed_timestamps']);
@@ -323,7 +324,15 @@ class CLI_Commands
                 continue;
             }
 
-            $duplicates = array_slice($group['events'], 1);
+            $retained_index = $this->cron_dedupe_retained_event_index($group['events']);
+            $retained_event = $group['events'][$retained_index];
+            $duplicates = [];
+
+            foreach ($group['events'] as $index => $event) {
+                if ($index !== $retained_index) {
+                    $duplicates[] = $event;
+                }
+            }
             $removed_timestamps = [];
 
             foreach ($duplicates as $event) {
@@ -343,12 +352,30 @@ class CLI_Commands
                 'hook'               => $group['hook'],
                 'schedule'           => $group['schedule'] !== '' ? $group['schedule'] : '(one-shot)',
                 'duplicates'         => $duplicate_count,
-                'retained_timestamp' => (int) $group['events'][0]['timestamp'],
+                'retained_timestamp' => (int) $retained_event['timestamp'],
                 'removed_timestamps' => implode(',', array_map('strval', $removed_timestamps)),
             ];
         }
 
         return $report;
+    }
+
+    /**
+     * Retain the event most likely to keep a recurring schedule healthy.
+     *
+     * @param list<array{timestamp: int}> $events Ascending by timestamp.
+     */
+    private function cron_dedupe_retained_event_index(array $events): int
+    {
+        $now = time();
+
+        foreach ($events as $index => $event) {
+            if ($event['timestamp'] >= $now) {
+                return $index;
+            }
+        }
+
+        return array_key_last($events);
     }
 
     /**
