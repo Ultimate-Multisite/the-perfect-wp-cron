@@ -440,7 +440,9 @@ namespace {
     assert_same([], $GLOBALS['test_crons'], 'Malformed-key WP-Cron payloads must be removed from the cron array');
 
     $recurring_timestamp = time() - 7200;
-    $recurring_target = $recurring_timestamp + 10800;
+    // A cron dedupe may retain a later equivalent event that is not the exact
+    // timestamp wp_reschedule_event() would calculate from the stale row.
+    $recurring_target = $recurring_timestamp + 14400;
     $recurring_key = md5(serialize(['site_id' => 7]));
     $recurring_job = [
         'hook'      => 'duplicate_recurring_hook',
@@ -466,7 +468,7 @@ namespace {
     $GLOBALS['test_reschedule_result'] = true;
     invoke_private($executor, 'execute_wp_cron', [$recurring_job]);
     assert_same([], $GLOBALS['test_fired_actions'], 'A stale recurring duplicate must not replay its callback');
-    assert_same([], $GLOBALS['test_rescheduled_events'], 'A stale recurring duplicate must not reschedule an existing successor');
+    assert_same([], $GLOBALS['test_rescheduled_events'], 'A stale recurring duplicate must not reschedule when any later equivalent event exists');
     assert_same([
         ['timestamp' => $recurring_timestamp, 'hook' => 'duplicate_recurring_hook', 'args' => ['site_id' => 7]],
     ], $GLOBALS['test_unscheduled_events'], 'A stale recurring duplicate must be removed after its successor is confirmed');
