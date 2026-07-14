@@ -229,7 +229,7 @@ class CLI_Commands
      * : Report duplicate groups without modifying cron options.
      *
      * [--apply]
-     * : Remove duplicate events with wp_unschedule_event().
+      * : Remove duplicate event rows from the persisted cron array.
      *
      * ## EXAMPLES
      *
@@ -311,6 +311,7 @@ class CLI_Commands
      */
     private function cron_dedupe_site_report(int $site_id, bool $apply): array
     {
+        $this->flush_cron_option_cache();
         $crons = _get_cron_array();
         if (!is_array($crons)) {
             return ['groups' => 0, 'retained' => 0, 'removed' => 0, 'rows' => []];
@@ -318,6 +319,7 @@ class CLI_Commands
 
         $groups = $this->cron_duplicate_groups($crons);
         $report = ['groups' => 0, 'retained' => 0, 'removed' => 0, 'rows' => []];
+        $updated_crons = $crons;
 
         foreach ($groups as $group) {
             if (count($group['events']) < 2) {
@@ -339,7 +341,15 @@ class CLI_Commands
                 $removed_timestamps[] = (int) $event['timestamp'];
 
                 if ($apply) {
-                    wp_unschedule_event((int) $event['timestamp'], $group['hook'], $group['args']);
+                    unset($updated_crons[$event['timestamp']][$group['hook']][$event['key']]);
+
+                    if (empty($updated_crons[$event['timestamp']][$group['hook']])) {
+                        unset($updated_crons[$event['timestamp']][$group['hook']]);
+                    }
+
+                    if (empty($updated_crons[$event['timestamp']])) {
+                        unset($updated_crons[$event['timestamp']]);
+                    }
                 }
             }
 
@@ -357,7 +367,25 @@ class CLI_Commands
             ];
         }
 
+        if ($apply && _set_cron_array($updated_crons) === false) {
+            WP_CLI::error('Failed to update the cron array while removing duplicates.');
+        }
+
+        if ($apply) {
+            $this->flush_cron_option_cache();
+        }
+
         return $report;
+    }
+
+    private function flush_cron_option_cache(): void
+    {
+        if (!function_exists('wp_cache_delete')) {
+            return;
+        }
+
+        wp_cache_delete('cron', 'options');
+        wp_cache_delete('alloptions', 'options');
     }
 
     /**
@@ -379,7 +407,7 @@ class CLI_Commands
     }
 
     /**
-     * @return array<string, array{hook: string, schedule: string, args: array, events: list<array{timestamp: int}>}>
+     * @return array<string, array{hook: string, schedule: string, args: array, events: list<array{timestamp: int, key: string}>}>
      */
     private function cron_duplicate_groups(array $crons): array
     {
@@ -395,7 +423,7 @@ class CLI_Commands
                     continue;
                 }
 
-                foreach ($events as $event) {
+                foreach ($events as $key => $event) {
                     if (!is_array($event)) {
                         continue;
                     }
@@ -410,7 +438,10 @@ class CLI_Commands
                         ];
                     }
 
-                    $groups[$signature]['events'][] = ['timestamp' => (int) $timestamp];
+                    $groups[$signature]['events'][] = [
+                        'timestamp' => (int) $timestamp,
+                        'key'       => (string) $key,
+                    ];
                 }
             }
         }
