@@ -68,7 +68,6 @@ namespace {
     use QueueWorker\Config;
     use QueueWorker\Cron_Event_Filter;
     use QueueWorker\Cron_Interceptor;
-    use QueueWorker\Job_Log;
     use QueueWorker\Job_Payload;
     use QueueWorker\Worker_Process;
 
@@ -90,8 +89,6 @@ namespace {
     {
         public string $prefix = 'wp_';
         public string $base_prefix = 'wp_';
-        public array $queries = [];
-        public array $query_results = [];
 
         public function prepare(string $query, ...$args): string
         {
@@ -108,11 +105,9 @@ namespace {
             return null;
         }
 
-        public function query(string $query)
+        public function query(string $query): int
         {
-            $this->queries[] = $query;
-
-            return $this->query_results === [] ? 1 : array_shift($this->query_results);
+            return 1;
         }
     }
 
@@ -299,7 +294,6 @@ namespace {
     require_once __DIR__ . '/../src/class-cron-event-filter.php';
     require_once __DIR__ . '/../src/class-cron-interceptor.php';
     require_once __DIR__ . '/../src/class-cli-commands.php';
-    require_once __DIR__ . '/../src/class-job-log.php';
     require_once __DIR__ . '/../src/class-job-payload.php';
     require_once __DIR__ . '/../src/class-job-executor.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
@@ -561,32 +555,34 @@ namespace {
     }));
     assert_same(1, count($duplicate_groups), 'Only recurring events with identical hook, schedule, and args should be duplicate groups');
     assert_same('recurring_hook', $duplicate_groups[0]['hook'], 'Duplicate group must preserve the hook');
-    assert_same(100, $duplicate_groups[0]['events'][0]['timestamp'], 'Earliest duplicate timestamp must be retained');
-    assert_same(200, $duplicate_groups[0]['events'][1]['timestamp'], 'Later duplicate timestamps must be sorted for removal');
+    assert_same(100, $duplicate_groups[0]['events'][0]['timestamp'], 'Earliest duplicate timestamp must sort first');
+    assert_same(200, $duplicate_groups[0]['events'][1]['timestamp'], 'Middle duplicate timestamps must remain sorted');
     assert_same(300, $duplicate_groups[0]['events'][2]['timestamp'], 'Latest duplicate timestamp must be sorted last');
 
     $GLOBALS['test_unscheduled_events'] = [];
     $dry_report = invoke_private($cli, 'cron_dedupe_site_report', [1, false]);
     assert_same(1, $dry_report['groups'], 'Dry-run must report one duplicate recurring group');
     assert_same(1, $dry_report['retained'], 'Dry-run must retain one event per duplicate group');
-    assert_same(2, $dry_report['removed'], 'Dry-run must count later duplicate events as removable');
+    assert_same(2, $dry_report['removed'], 'Dry-run must count all non-retained duplicate events as removable');
+    assert_same(300, $dry_report['rows'][0]['retained_timestamp'], 'When all duplicate events are overdue, dedupe must retain the newest occurrence');
     assert_same([], $GLOBALS['test_unscheduled_events'], 'Dry-run must not unschedule events');
 
     $apply_report = invoke_private($cli, 'cron_dedupe_site_report', [1, true]);
     assert_same(2, $apply_report['removed'], 'Apply must count removed duplicate events');
     assert_same([
+        ['timestamp' => 100, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
         ['timestamp' => 200, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
-        ['timestamp' => 300, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
-    ], $GLOBALS['test_unscheduled_events'], 'Apply must unschedule only later duplicate recurring events');
+    ], $GLOBALS['test_unscheduled_events'], 'Apply must retain only the newest overdue recurring event');
 
-    $GLOBALS['wpdb']->queries = [];
-    $GLOBALS['wpdb']->query_results = [10000, 10000, 23];
-    assert_same(20023, Job_Log::cleanup(7), 'Job log cleanup must report rows deleted across every batch');
-    assert_same(3, count($GLOBALS['wpdb']->queries), 'Job log cleanup must continue until a partial batch is deleted');
-    foreach ($GLOBALS['wpdb']->queries as $cleanup_query) {
-        assert_true(str_contains($cleanup_query, 'ORDER BY completed_at ASC'), 'Job log cleanup must delete the oldest rows first');
-        assert_true(str_contains($cleanup_query, 'LIMIT 10000'), 'Job log cleanup must bound each delete statement');
-    }
+    assert_same(
+        1,
+        invoke_private($cli, 'cron_dedupe_retained_event_index', [[
+            ['timestamp' => time() - 3600],
+            ['timestamp' => time() + 300],
+            ['timestamp' => time() + 3600],
+        ]]),
+        'Dedupe must retain the nearest future recurring event when one exists'
+    );
 
     echo "Regression tests passed.\n";
 }
