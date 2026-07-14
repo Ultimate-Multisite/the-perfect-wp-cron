@@ -154,16 +154,11 @@ class Job_Executor
 
     private function unschedule_cron_event(int $timestamp, string $hook, array $args): bool
     {
-        $unscheduled = wp_unschedule_event($timestamp, $hook, $args);
-
-        if ($unscheduled !== false) {
-            return true;
-        }
-
-        // Some cron arrays can contain malformed event keys that do not match
-        // WordPress' md5( serialize( $args ) ) convention. In that state
-        // wp_unschedule_event() cannot remove the row even though the event is
-        // present, so remove the matching hook/args manually before firing.
+        // Write the current cron array directly. Apart from supporting malformed
+        // event keys, this avoids a stale persistent object-cache read causing
+        // wp_unschedule_event() to report success while leaving the due row for
+        // the next worker scan.
+        $this->flush_cron_option_cache();
         $crons = _get_cron_array();
         $key = $this->find_cron_event_key($crons, $timestamp, $hook, $args);
 
@@ -181,7 +176,10 @@ class Job_Executor
             unset($crons[$timestamp]);
         }
 
-        return _set_cron_array($crons) !== false;
+        $updated = _set_cron_array($crons) !== false;
+        $this->flush_cron_option_cache();
+
+        return $updated;
     }
 
     private function recurring_successor_exists(array $crons, int $timestamp, string $hook, array $args, string $schedule, string $event_key): bool
