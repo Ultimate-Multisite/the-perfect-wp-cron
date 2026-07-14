@@ -459,6 +459,33 @@ namespace {
     assert_true(!isset($GLOBALS['test_crons'][$recurring_timestamp]), 'A stale recurring duplicate must be removed after its successor is confirmed');
     assert_true(isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_hook'][$recurring_key]), 'The authoritative recurring successor must remain scheduled');
 
+    $malformed_successor_key = 'malformed-successor-key';
+    $GLOBALS['test_crons'] = [
+        $recurring_timestamp => [
+            'duplicate_recurring_malformed_successor_hook' => [
+                $recurring_key => ['schedule' => 'hourly', 'args' => ['site_id' => 7], 'interval' => 3600],
+            ],
+        ],
+        $recurring_target => [
+            'duplicate_recurring_malformed_successor_hook' => [
+                $malformed_successor_key => ['schedule' => 'hourly', 'args' => ['site_id' => 7], 'interval' => 3600],
+            ],
+        ],
+    ];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_rescheduled_events'] = [];
+    invoke_private($executor, 'execute_wp_cron', [[
+        'hook'      => 'duplicate_recurring_malformed_successor_hook',
+        'args'      => ['site_id' => 7],
+        'timestamp' => $recurring_timestamp,
+        'schedule'  => 'hourly',
+    ]]);
+    assert_same([], $GLOBALS['test_fired_actions'], 'A stale recurring duplicate must not fire while normalizing a malformed successor key');
+    assert_same([], $GLOBALS['test_rescheduled_events'], 'A stale recurring duplicate must not reschedule when its successor key is malformed');
+    assert_true(!isset($GLOBALS['test_crons'][$recurring_timestamp]), 'A stale recurring duplicate must be removed after its malformed successor is normalized');
+    assert_true(isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_malformed_successor_hook'][$recurring_key]), 'A malformed recurring successor key must be repaired to WordPress canonical form');
+    assert_true(!isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_malformed_successor_hook'][$malformed_successor_key]), 'The malformed recurring successor key must be removed after repair');
+
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL');
     assert_same(5, Config::action_scheduler_rescan_interval(), 'AS rescan interval must default to five seconds');
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL=12');
@@ -557,6 +584,7 @@ namespace {
     );
 
     $GLOBALS['test_crons'] = $duplicate_crons;
+    $canonical_recurring_key = md5(serialize(['a' => 1]));
     $groups = invoke_private($cli, 'cron_duplicate_groups', [$GLOBALS['test_crons']]);
     $duplicate_groups = array_values(array_filter($groups, static function (array $group): bool {
         return count($group['events']) > 1;
@@ -581,7 +609,8 @@ namespace {
         !isset($GLOBALS['test_crons'][100]['recurring_hook']) && !isset($GLOBALS['test_crons'][200]['recurring_hook']['middle']),
         'Apply must remove malformed-key duplicate rows directly'
     );
-    assert_true(isset($GLOBALS['test_crons'][300]['recurring_hook']['first']), 'Apply must retain the newest overdue recurring event');
+    assert_true(isset($GLOBALS['test_crons'][300]['recurring_hook'][$canonical_recurring_key]), 'Apply must retain the newest overdue recurring event under its canonical WordPress key');
+    assert_true(!isset($GLOBALS['test_crons'][300]['recurring_hook']['first']), 'Apply must remove the retained event malformed key after canonicalizing it');
 
     assert_same(
         2,

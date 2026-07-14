@@ -117,7 +117,7 @@ class Job_Executor
             // a cron dedupe, which need not be the timestamp WordPress would
             // calculate from this stale row. Remove the stale duplicate without
             // replaying its callback or creating another recurrence.
-            if ($this->recurring_successor_exists($crons, $timestamp, $hook, $args, $schedule, $event_key)) {
+            if ($this->normalize_recurring_successor_if_exists($crons, $timestamp, $hook, $args, $schedule, $event_key)) {
                 if (!$this->unschedule_cron_event($timestamp, $hook, $args)) {
                     throw new \RuntimeException(sprintf('Failed to remove duplicate cron event %s at %d', $hook, $timestamp));
                 }
@@ -182,7 +182,7 @@ class Job_Executor
         return $updated;
     }
 
-    private function recurring_successor_exists(array $crons, int $timestamp, string $hook, array $args, string $schedule, string $event_key): bool
+    private function normalize_recurring_successor_if_exists(array $crons, int $timestamp, string $hook, array $args, string $schedule, string $event_key): bool
     {
         $event = $crons[$timestamp][$hook][$event_key] ?? null;
         if (!is_array($event)) {
@@ -194,18 +194,53 @@ class Job_Executor
                 continue;
             }
 
-            foreach ($candidate_hooks[$hook] as $candidate_event) {
+            foreach ($candidate_hooks[$hook] as $candidate_key => $candidate_event) {
                 if (!is_array($candidate_event)) {
                     continue;
                 }
 
                 if (($candidate_event['schedule'] ?? '') === $schedule && ($candidate_event['args'] ?? []) === $args) {
+                    if (!$this->normalize_cron_event_key((int) $candidate_timestamp, $hook, $args, (string) $candidate_key)) {
+                        throw new \RuntimeException(sprintf('Failed to normalize successor cron event %s at %d', $hook, (int) $candidate_timestamp));
+                    }
+
                     return true;
                 }
             }
         }
 
         return false;
+    }
+
+    private function normalize_cron_event_key(int $timestamp, string $hook, array $args, string $current_key): bool
+    {
+        $canonical_key = md5(serialize($args));
+        if ($current_key === $canonical_key) {
+            return true;
+        }
+
+        $this->flush_cron_option_cache();
+        $crons = _get_cron_array();
+
+        if (empty($crons[$timestamp][$hook]) || !is_array($crons[$timestamp][$hook])) {
+            return true;
+        }
+
+        if (!isset($crons[$timestamp][$hook][$current_key])) {
+            return true;
+        }
+
+        $event = $crons[$timestamp][$hook][$current_key];
+        unset($crons[$timestamp][$hook][$current_key]);
+
+        if (!isset($crons[$timestamp][$hook][$canonical_key])) {
+            $crons[$timestamp][$hook][$canonical_key] = $event;
+        }
+
+        $updated = _set_cron_array($crons) !== false;
+        $this->flush_cron_option_cache();
+
+        return $updated;
     }
 
     private function find_cron_event_key($crons, int $timestamp, string $hook, array $args): ?string

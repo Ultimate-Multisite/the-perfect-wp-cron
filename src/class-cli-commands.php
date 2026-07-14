@@ -219,8 +219,9 @@ class CLI_Commands
      * Duplicate recurring events can accumulate when long-running event-loop
      * execution, wp_reschedule_event(), backlog catch-up, and plugin bootstrap
      * scheduling all touch the same hook. This command groups events by site,
-     * hook, schedule, and args; keeps the newest occurrence; and optionally
-     * removes all other rows for identical recurring/event signatures.
+     * hook, schedule, and args; keeps the newest occurrence; repairs its cron
+     * array key when malformed; and optionally removes all other rows for
+     * identical recurring/event signatures.
      *
      * ## OPTIONS
      *
@@ -352,6 +353,10 @@ class CLI_Commands
                 }
             }
 
+            if ($apply) {
+                $this->normalize_retained_cron_event_key($updated_crons, $group, $retained_event);
+            }
+
             $duplicate_count = count($duplicates);
             $report['groups']++;
             $report['retained']++;
@@ -398,6 +403,43 @@ class CLI_Commands
     private function cron_dedupe_retained_event_index(array $events): int
     {
         return array_key_last($events);
+    }
+
+    /**
+     * Restore WordPress' canonical md5( serialize( args ) ) key for the retained
+     * event. Malformed keys make wp_next_scheduled() miss an otherwise healthy
+     * future recurrence, so plugin bootstrap code schedules a near-immediate
+     * duplicate on the next request.
+     *
+     * @param array<int, array<string, array<string, array>>> $crons Mutable cron array.
+     * @param array{hook: string, args: array} $group Duplicate group metadata.
+     * @param array{timestamp: int, key: string} $event Retained event metadata.
+     */
+    private function normalize_retained_cron_event_key(array &$crons, array $group, array $event): void
+    {
+        $timestamp = (int) $event['timestamp'];
+        $hook = $group['hook'];
+        $current_key = (string) $event['key'];
+        $canonical_key = md5(serialize($group['args']));
+
+        if ($current_key === $canonical_key) {
+            return;
+        }
+
+        if (empty($crons[$timestamp][$hook]) || !is_array($crons[$timestamp][$hook])) {
+            return;
+        }
+
+        if (!isset($crons[$timestamp][$hook][$current_key])) {
+            return;
+        }
+
+        $retained_event = $crons[$timestamp][$hook][$current_key];
+        unset($crons[$timestamp][$hook][$current_key]);
+
+        if (!isset($crons[$timestamp][$hook][$canonical_key])) {
+            $crons[$timestamp][$hook][$canonical_key] = $retained_event;
+        }
     }
 
     /**
