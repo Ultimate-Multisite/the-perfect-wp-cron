@@ -219,9 +219,8 @@ class CLI_Commands
      * Duplicate recurring events can accumulate when long-running event-loop
      * execution, wp_reschedule_event(), backlog catch-up, and plugin bootstrap
      * scheduling all touch the same hook. This command groups events by site,
-     * hook, schedule, and args; keeps the nearest future occurrence (or the
-     * newest overdue occurrence); and optionally removes all other rows for
-     * identical recurring/event signatures.
+     * hook, schedule, and args; keeps the newest occurrence; and optionally
+     * removes all other rows for identical recurring/event signatures.
      *
      * ## OPTIONS
      *
@@ -278,7 +277,7 @@ class CLI_Commands
         }
 
         WP_CLI::log($apply ? 'Duplicate WP-Cron cleanup applied.' : 'Duplicate WP-Cron dry-run report. No changes were made.');
-        WP_CLI::log('Grouping key: site_id + hook + schedule + args; nearest future or newest overdue timestamp retained.');
+        WP_CLI::log('Grouping key: site_id + hook + schedule + args; newest timestamp retained.');
 
         if (!empty($rows)) {
             \WP_CLI\Utils\format_items('table', $rows, ['site_id', 'hook', 'schedule', 'duplicates', 'retained_timestamp', 'removed_timestamps']);
@@ -389,20 +388,15 @@ class CLI_Commands
     }
 
     /**
-     * Retain the event most likely to keep a recurring schedule healthy.
+     * Retain the newest occurrence. Stale recurring payloads and plugin
+     * bootstrap checks can create near-immediate duplicates even when a healthy
+     * weekly/monthly successor already exists, so keeping the latest timestamp
+     * avoids feeding an immediate replay loop.
      *
-     * @param list<array{timestamp: int}> $events Ascending by timestamp.
+     * @param list<array{timestamp: int, key?: string}> $events Ascending by timestamp.
      */
     private function cron_dedupe_retained_event_index(array $events): int
     {
-        $now = time();
-
-        foreach ($events as $index => $event) {
-            if ($event['timestamp'] >= $now) {
-                return $index;
-            }
-        }
-
         return array_key_last($events);
     }
 
