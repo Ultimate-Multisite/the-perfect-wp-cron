@@ -204,18 +204,7 @@ namespace {
         $key = md5(serialize($args));
 
         if (!isset($GLOBALS['test_crons'][$timestamp][$hook][$key])) {
-            $key = null;
-
-            foreach ($GLOBALS['test_crons'][$timestamp][$hook] ?? [] as $event_key => $event) {
-                if (($event['args'] ?? []) === $args) {
-                    $key = $event_key;
-                    break;
-                }
-            }
-
-            if ($key === null) {
-                return false;
-            }
+            return false;
         }
 
         $GLOBALS['test_unscheduled_events'][] = [
@@ -413,9 +402,7 @@ namespace {
     assert_same([
         ['hook' => 'fresh_one_shot_hook', 'args' => ['a' => 1]],
     ], $GLOBALS['test_fired_actions'], 'A one-shot WP-Cron payload must fire once and skip duplicate stale executions');
-    assert_same([
-        ['timestamp' => 500, 'hook' => 'fresh_one_shot_hook', 'args' => ['a' => 1]],
-    ], $GLOBALS['test_unscheduled_events'], 'A one-shot WP-Cron payload must be unscheduled before firing');
+    assert_same([], $GLOBALS['test_crons'], 'A one-shot WP-Cron payload must be removed before firing');
 
     $malformed_job = [
         'hook'      => 'malformed_one_shot_hook',
@@ -469,9 +456,7 @@ namespace {
     invoke_private($executor, 'execute_wp_cron', [$recurring_job]);
     assert_same([], $GLOBALS['test_fired_actions'], 'A stale recurring duplicate must not replay its callback');
     assert_same([], $GLOBALS['test_rescheduled_events'], 'A stale recurring duplicate must not reschedule when any later equivalent event exists');
-    assert_same([
-        ['timestamp' => $recurring_timestamp, 'hook' => 'duplicate_recurring_hook', 'args' => ['site_id' => 7]],
-    ], $GLOBALS['test_unscheduled_events'], 'A stale recurring duplicate must be removed after its successor is confirmed');
+    assert_true(!isset($GLOBALS['test_crons'][$recurring_timestamp]), 'A stale recurring duplicate must be removed after its successor is confirmed');
     assert_true(isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_hook'][$recurring_key]), 'The authoritative recurring successor must remain scheduled');
 
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL');
@@ -577,10 +562,11 @@ namespace {
 
     $apply_report = invoke_private($cli, 'cron_dedupe_site_report', [1, true]);
     assert_same(2, $apply_report['removed'], 'Apply must count removed duplicate events');
-    assert_same([
-        ['timestamp' => 100, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
-        ['timestamp' => 200, 'hook' => 'recurring_hook', 'args' => ['a' => 1]],
-    ], $GLOBALS['test_unscheduled_events'], 'Apply must retain only the newest overdue recurring event');
+    assert_true(
+        !isset($GLOBALS['test_crons'][100]['recurring_hook']) && !isset($GLOBALS['test_crons'][200]['recurring_hook']['middle']),
+        'Apply must remove malformed-key duplicate rows directly'
+    );
+    assert_true(isset($GLOBALS['test_crons'][300]['recurring_hook']['first']), 'Apply must retain the newest overdue recurring event');
 
     assert_same(
         1,
