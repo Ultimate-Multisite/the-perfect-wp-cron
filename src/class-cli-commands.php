@@ -367,7 +367,7 @@ class CLI_Commands
             ];
         }
 
-        if ($apply && _set_cron_array($updated_crons) === false) {
+        if ($apply && $report['removed'] > 0 && _set_cron_array($updated_crons) === false) {
             WP_CLI::error('Failed to update the cron array while removing duplicates.');
         }
 
