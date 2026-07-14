@@ -80,6 +80,7 @@ namespace {
     $GLOBALS['test_switched_blogs'] = [];
     $GLOBALS['test_unscheduled_events'] = [];
     $GLOBALS['test_rescheduled_events'] = [];
+    $GLOBALS['test_reschedule_result'] = true;
     $GLOBALS['test_fired_actions'] = [];
     $GLOBALS['test_cache_deletes'] = [];
     $GLOBALS['test_ms_switched'] = false;
@@ -231,8 +232,9 @@ namespace {
         return true;
     }
 
-    function wp_reschedule_event(int $timestamp, string $schedule, string $hook, array $args = []): bool
+    function wp_reschedule_event(int $timestamp, string $schedule, string $hook, array $args = [], bool $wp_error = false)
     {
+        unset($wp_error);
         $GLOBALS['test_rescheduled_events'][] = [
             'timestamp' => $timestamp,
             'schedule'  => $schedule,
@@ -240,7 +242,14 @@ namespace {
             'args'      => $args,
         ];
 
-        return true;
+        return $GLOBALS['test_reschedule_result'];
+    }
+
+    function is_wp_error($thing): bool
+    {
+        unset($thing);
+
+        return false;
     }
 
     function do_action_ref_array(string $hook, array $args): void
@@ -423,6 +432,39 @@ namespace {
         ['hook' => 'malformed_one_shot_hook', 'args' => []],
     ], $GLOBALS['test_fired_actions'], 'Malformed-key WP-Cron payloads must be removed directly and fire once');
     assert_same([], $GLOBALS['test_crons'], 'Malformed-key WP-Cron payloads must be removed from the cron array');
+
+    $recurring_timestamp = time() - 7200;
+    $recurring_target = $recurring_timestamp + 10800;
+    $recurring_key = md5(serialize(['site_id' => 7]));
+    $recurring_job = [
+        'hook'      => 'duplicate_recurring_hook',
+        'args'      => ['site_id' => 7],
+        'timestamp' => $recurring_timestamp,
+        'schedule'  => 'hourly',
+    ];
+    $GLOBALS['test_crons'] = [
+        $recurring_timestamp => [
+            'duplicate_recurring_hook' => [
+                $recurring_key => ['schedule' => 'hourly', 'args' => ['site_id' => 7], 'interval' => 3600],
+            ],
+        ],
+        $recurring_target => [
+            'duplicate_recurring_hook' => [
+                $recurring_key => ['schedule' => 'hourly', 'args' => ['site_id' => 7], 'interval' => 3600],
+            ],
+        ],
+    ];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_unscheduled_events'] = [];
+    $GLOBALS['test_rescheduled_events'] = [];
+    $GLOBALS['test_reschedule_result'] = true;
+    invoke_private($executor, 'execute_wp_cron', [$recurring_job]);
+    assert_same([], $GLOBALS['test_fired_actions'], 'A stale recurring duplicate must not replay its callback');
+    assert_same([], $GLOBALS['test_rescheduled_events'], 'A stale recurring duplicate must not reschedule an existing successor');
+    assert_same([
+        ['timestamp' => $recurring_timestamp, 'hook' => 'duplicate_recurring_hook', 'args' => ['site_id' => 7]],
+    ], $GLOBALS['test_unscheduled_events'], 'A stale recurring duplicate must be removed after its successor is confirmed');
+    assert_true(isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_hook'][$recurring_key]), 'The authoritative recurring successor must remain scheduled');
 
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL');
     assert_same(5, Config::action_scheduler_rescan_interval(), 'AS rescan interval must default to five seconds');
