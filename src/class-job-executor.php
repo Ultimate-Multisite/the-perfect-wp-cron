@@ -112,10 +112,11 @@ class Job_Executor
         // Without this, the event is simply deleted and plugins re-register it
         // at time() on next load, causing an infinite rapid-fire loop.
         if ($schedule !== '') {
-            // A previous attempt can have successfully created the next
-            // occurrence but stopped before removing this stale row. WordPress
-            // then returns false because writing the identical next event is a
-            // no-op. Remove the stale duplicate without replaying its callback.
+            // A prior execution may already have created a later equivalent
+            // event before stopping. This also covers the retained event after
+            // a cron dedupe, which need not be the timestamp WordPress would
+            // calculate from this stale row. Remove the stale duplicate without
+            // replaying its callback or creating another recurrence.
             if ($this->recurring_successor_exists($crons, $timestamp, $hook, $args, $schedule, $event_key)) {
                 if (!$this->unschedule_cron_event($timestamp, $hook, $args)) {
                     throw new \RuntimeException(sprintf('Failed to remove duplicate cron event %s at %d', $hook, $timestamp));
@@ -190,29 +191,23 @@ class Job_Executor
             return false;
         }
 
-        $interval = (int) ($event['interval'] ?? 0);
-        if ($interval < 1) {
-            $schedules = wp_get_schedules();
-            $interval = (int) ($schedules[$schedule]['interval'] ?? 0);
+        foreach ($crons as $candidate_timestamp => $candidate_hooks) {
+            if ((int) $candidate_timestamp <= $timestamp || !isset($candidate_hooks[$hook])) {
+                continue;
+            }
+
+            foreach ($candidate_hooks[$hook] as $candidate_event) {
+                if (!is_array($candidate_event)) {
+                    continue;
+                }
+
+                if (($candidate_event['schedule'] ?? '') === $schedule && ($candidate_event['args'] ?? []) === $args) {
+                    return true;
+                }
+            }
         }
 
-        if ($interval < 1) {
-            return false;
-        }
-
-        $now = time();
-        $next_timestamp = $timestamp >= $now
-            ? $now + $interval
-            : $now + ($interval - (($now - $timestamp) % $interval));
-        $next_key = $this->find_cron_event_key($crons, $next_timestamp, $hook, $args);
-
-        if ($next_key === null) {
-            return false;
-        }
-
-        $next_event = $crons[$next_timestamp][$hook][$next_key] ?? null;
-
-        return is_array($next_event) && ($next_event['schedule'] ?? '') === $schedule;
+        return false;
     }
 
     private function find_cron_event_key($crons, int $timestamp, string $hook, array $args): ?string
