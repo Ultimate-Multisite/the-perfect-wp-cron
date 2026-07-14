@@ -584,13 +584,13 @@ namespace {
     assert_true(isset($GLOBALS['test_crons'][300]['recurring_hook']['first']), 'Apply must retain the newest overdue recurring event');
 
     assert_same(
-        1,
+        2,
         invoke_private($cli, 'cron_dedupe_retained_event_index', [[
             ['timestamp' => time() - 3600],
             ['timestamp' => time() + 300],
             ['timestamp' => time() + 3600],
         ]]),
-        'Dedupe must retain the nearest future recurring event when one exists'
+        'Dedupe must retain the newest recurring event when future duplicates exist'
     );
 
     $GLOBALS['wpdb']->queries = [];
