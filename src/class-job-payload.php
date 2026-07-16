@@ -19,7 +19,7 @@ class Job_Payload
     public function __construct(array $data = [])
     {
         $this->site_id   = $data['site_id'] ?? self::current_site_id();
-        $this->site_url  = $data['site_url'] ?? get_site_url();
+        $this->site_url  = $data['site_url'] ?? self::current_site_url();
         $this->hook      = $data['hook'] ?? '';
         $this->args      = $data['args'] ?? [];
         $this->timestamp = $data['timestamp'] ?? 0;
@@ -67,7 +67,7 @@ class Job_Payload
 
         return new self([
             'site_id'   => self::current_site_id(),
-            'site_url'  => get_site_url(),
+            'site_url'  => self::current_site_url(),
             'hook'      => $event->hook,
             'args'      => $event->args ?? [],
             'timestamp' => (int) $event->timestamp,
@@ -96,7 +96,7 @@ class Job_Payload
 
         return new self([
             'site_id'   => self::current_site_id(),
-            'site_url'  => get_site_url(),
+            'site_url'  => self::current_site_url(),
             'hook'      => $action->get_hook(),
             'args'      => $action->get_args(),
             'timestamp' => $timestamp,
@@ -166,5 +166,42 @@ class Job_Payload
         }
 
         return get_current_blog_id();
+    }
+
+    /**
+     * Return a URL that WordPress can use to bootstrap the current site.
+     *
+     * During a full-network scan, get_site_url() can be filtered to a mapped,
+     * stale, or secondary-network domain. Bootstrapping a fresh executor with
+     * that URL can select a different routed database before switch_to_blog()
+     * runs. The wp_blogs domain and path are authoritative for switched-site
+     * scans because WordPress resolves them to the same blog the scanner read.
+     */
+    private static function current_site_url(): string
+    {
+        $site_url = get_site_url();
+
+        if (!function_exists('ms_is_switched') || !ms_is_switched() || !function_exists('get_site')) {
+            return $site_url;
+        }
+
+        $site = get_site(get_current_blog_id());
+        if (!$site || empty($site->domain)) {
+            return $site_url;
+        }
+
+        $scheme = (string) parse_url($site_url, PHP_URL_SCHEME);
+        if (!in_array($scheme, ['http', 'https'], true)) {
+            $scheme = 'https';
+        }
+
+        $path = (string) ($site->path ?? '/');
+        if ($path === '') {
+            $path = '/';
+        } elseif ($path[0] !== '/') {
+            $path = '/' . $path;
+        }
+
+        return $scheme . '://' . (string) $site->domain . $path;
     }
 }

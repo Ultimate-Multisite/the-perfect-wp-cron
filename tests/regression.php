@@ -85,6 +85,9 @@ namespace {
     $GLOBALS['test_fired_actions'] = [];
     $GLOBALS['test_cache_deletes'] = [];
     $GLOBALS['test_ms_switched'] = false;
+    $GLOBALS['test_site_url'] = 'https://example.test';
+    $GLOBALS['test_site_domain'] = 'example.test';
+    $GLOBALS['test_site_path'] = '/';
 
     class Test_WPDB
     {
@@ -120,7 +123,17 @@ namespace {
 
     function get_site_url(): string
     {
-        return 'https://example.test';
+        return $GLOBALS['test_site_url'];
+    }
+
+    function get_site(int $site_id): object
+    {
+        unset($site_id);
+
+        return (object) [
+            'domain' => $GLOBALS['test_site_domain'],
+            'path'   => $GLOBALS['test_site_path'],
+        ];
     }
 
     function get_current_blog_id(): int
@@ -344,6 +357,9 @@ namespace {
     ])), 'Registry fixture must be writable');
     $GLOBALS['test_current_blog_id'] = 49;
     $GLOBALS['test_ms_switched'] = true;
+    $GLOBALS['test_site_url'] = 'https://mapped.example.test/wp';
+    $GLOBALS['test_site_domain'] = 'translate.internal.test';
+    $GLOBALS['test_site_path'] = '/translations/';
     $switched_payload = new Job_Payload([
         'hook' => 'switched_site_hook',
         'args' => [],
@@ -353,7 +369,26 @@ namespace {
         'group' => 'translate',
     ]);
     assert_same(49, $switched_payload->site_id, 'Payload site ID must follow the switched blog during network scans');
+    assert_same(
+        'https://translate.internal.test/translations/',
+        $switched_payload->site_url,
+        'Payload URL must use the wp_blogs domain and path instead of a filtered siteurl during switched-site scans'
+    );
+    $switched_cron_payload = Job_Payload::from_cron_event((object) [
+        'hook'      => 'switched_cron_hook',
+        'args'      => [],
+        'timestamp' => 1710000000,
+        'schedule'  => 'hourly',
+    ]);
+    assert_same(
+        'https://translate.internal.test/translations/',
+        $switched_cron_payload->site_url,
+        'WP-Cron factory payloads must preserve the canonical switched-site bootstrap URL'
+    );
     restore_current_blog();
+    $GLOBALS['test_site_url'] = 'https://example.test';
+    $GLOBALS['test_site_domain'] = 'example.test';
+    $GLOBALS['test_site_path'] = '/';
 
     invoke_private($worker, 'schedule_timer', [new Job_Payload([
         'site_id' => 7,

@@ -95,12 +95,19 @@ if (!defined('DOING_CRON')) {
 
 require_once $wp_load;
 
-// Ensure we're on the correct blog
+// The payload URL must bootstrap the expected blog. Switching only after
+// WordPress loads is unsafe because site-active plugins and database routing
+// have already been selected for the wrong site.
 $site_id = (int) ($payload['site_id'] ?? get_current_blog_id());
 $is_sovereign_tenant = (defined('WU_MT_SOVEREIGN_TENANT') && (int) WU_MT_SOVEREIGN_TENANT === $site_id)
     || qw_payload_matches_sovereign_registry($site_id, $domain);
 if (!$is_sovereign_tenant && $site_id !== get_current_blog_id()) {
-    switch_to_blog($site_id);
+    fwrite(STDERR, sprintf(
+        "Payload site mismatch: URL resolved to blog %d, expected blog %d.\n",
+        get_current_blog_id(),
+        $site_id
+    ));
+    exit(1);
 }
 
 Job_Log::ensure_table();
