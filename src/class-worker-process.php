@@ -64,6 +64,8 @@ class Worker_Process
     private int $last_rescan_started = 0;
     private int $last_rescan_finished = 0;
     private int $last_rescan_duration = 0;
+    private bool $is_ready = false;
+    private string $failure_reason = '';
 
     public function __construct(string $wp_load, string $primary_domain, string $execute_script, string $scan_script = '')
     {
@@ -103,7 +105,13 @@ class Worker_Process
             chmod($socket_path, 0660);
         }
 
-        $this->bootstrap_wordpress();
+        try {
+            $this->bootstrap_wordpress();
+        } catch (\Throwable $e) {
+            $this->mark_unready($worker_id, 'startup', $e);
+            return;
+        }
+
         Worker::log(sprintf('[W%d] WordPress bootstrapped for scanning. Primary domain: %s', $worker_id, $this->primary_domain));
 
         self::ensure_lock_table();
@@ -159,6 +167,7 @@ class Worker_Process
         Timer::add(30, function () use ($worker_id) {
             $this->check_limits($worker_id);
         });
+        $this->is_ready = true;
     }
 
     /**
@@ -171,6 +180,12 @@ class Worker_Process
         $decoded = json_decode($data, true);
         if (is_array($decoded) && isset($decoded['command'])) {
             $this->handle_command($connection, $decoded);
+            return;
+        }
+
+        if (!$this->is_ready) {
+            Worker::log('[SOCKET] Dropping job because the worker is unavailable: ' . $this->failure_reason);
+            $connection->close();
             return;
         }
 
@@ -198,6 +213,22 @@ class Worker_Process
         $_SERVER['REQUEST_METHOD'] = 'GET';
 
         require_once $this->wp_load;
+    }
+
+    /**
+     * Leaves the worker available for status requests while preventing a failed
+     * startup from repeatedly crashing and respawning it.
+     */
+    private function mark_unready(int $worker_id, string $context, \Throwable $e): void
+    {
+        $this->is_ready = false;
+        $this->failure_reason = sprintf('%s failed: %s: %s', $context, get_class($e), $e->getMessage());
+
+        Worker::log(sprintf(
+            '[W%d][UNAVAILABLE] %s. Jobs are paused; resolve the error and restart the worker.',
+            $worker_id,
+            $this->failure_reason
+        ));
     }
 
     /**
@@ -1075,6 +1106,8 @@ class Worker_Process
                     'running_as_lanes' => $this->running_action_scheduler_counts(),
                     'pending_as_lanes' => $this->pending_action_scheduler_counts(),
                     'memory'          => sprintf('%.1f MB', $mem_mb),
+                    'ready'           => $this->is_ready,
+                    'failure_reason'  => $this->failure_reason,
                     'running_details' => $running_details,
                     'rescan'          => [
                         'in_progress' => $this->is_rescanning,

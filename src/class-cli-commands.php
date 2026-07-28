@@ -30,6 +30,12 @@ class CLI_Commands
         }
 
         WP_CLI::success('Queue worker is running.');
+        if (array_key_exists('ready', $data) && !$data['ready']) {
+            WP_CLI::warning(sprintf(
+                'Queue worker is unavailable: %s. Resolve the error and restart the worker.',
+                $data['failure_reason'] ?? 'unknown error'
+            ));
+        }
         WP_CLI::log(sprintf('  PID:            %d', $data['pid'] ?? 0));
         WP_CLI::log(sprintf('  Uptime:         %s', $data['uptime'] ?? 'unknown'));
         WP_CLI::log(sprintf('  Pending timers: %d', $data['pending_timers'] ?? 0));

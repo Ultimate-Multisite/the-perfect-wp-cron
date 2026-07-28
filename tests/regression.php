@@ -62,6 +62,18 @@ namespace {
             self::$successes[] = $message;
         }
     }
+
+    class Test_Connection
+    {
+        public bool $closed = false;
+        public ?string $response = null;
+
+        public function close(?string $response = null): void
+        {
+            $this->closed = true;
+            $this->response = $response;
+        }
+    }
 }
 
 namespace {
@@ -319,6 +331,26 @@ namespace {
     $decoded = json_decode($payload->to_json(), true);
     assert_same('checkout', $decoded['group'], 'Action Scheduler group must be serialized');
     assert_true(str_contains($payload->tracking_key(), ':checkout:'), 'Action Scheduler group must be part of the tracking key');
+
+    $failed_bootstrap_file = tempnam(sys_get_temp_dir(), 'qw-bootstrap-failure-');
+    assert_true(false !== $failed_bootstrap_file, 'Bootstrap failure fixture must be created');
+    assert_true(
+        false !== file_put_contents($failed_bootstrap_file, "<?php throw new \\RuntimeException('intentional bootstrap failure');"),
+        'Bootstrap failure fixture must be writable'
+    );
+    $failed_start_worker = new Worker_Process($failed_bootstrap_file, 'example.test', __FILE__);
+    $failed_start_worker->on_worker_start(new \Workerman\Worker());
+    assert_same(false, private_property($failed_start_worker, 'is_ready'), 'A bootstrap failure must leave the child running but unavailable');
+    assert_true(private_property($failed_start_worker, 'failure_reason') !== '', 'A bootstrap failure must retain an actionable reason');
+    $failed_start_status_connection = new Test_Connection();
+    $failed_start_worker->on_message($failed_start_status_connection, json_encode(['command' => 'status']));
+    $failed_start_status = json_decode((string) $failed_start_status_connection->response, true);
+    assert_same(false, $failed_start_status['ready'] ?? null, 'An unavailable worker must report its readiness state');
+    assert_true(($failed_start_status['failure_reason'] ?? '') !== '', 'An unavailable worker status response must report its failure reason');
+    $failed_start_job_connection = new Test_Connection();
+    $failed_start_worker->on_message($failed_start_job_connection, $payload->to_json());
+    assert_true($failed_start_job_connection->closed, 'An unavailable worker must reject queued jobs without crashing');
+    assert_true(unlink($failed_bootstrap_file), 'Bootstrap failure fixture must be removed');
 
     putenv('QUEUE_WORKER_AS_LANES=' . json_encode([
         [

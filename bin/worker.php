@@ -28,6 +28,13 @@ if (file_exists($plugin_autoload)) {
     require_once $plugin_autoload;
 }
 
+// Discover WordPress before loading the site Composer autoloader. Bedrock's
+// autoloaded plugin files may exit when ABSPATH has not been defined yet.
+$wp_load = Bootstrap::discover_wp_load(__DIR__);
+if (!defined('ABSPATH')) {
+    define('ABSPATH', rtrim(dirname($wp_load), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR);
+}
+
 // 2. Walk up from plugin root to find site autoloader (Bedrock: has Dotenv, etc.)
 $site_autoload = null;
 $search = dirname(__DIR__);
@@ -56,7 +63,6 @@ use QueueWorker\Worker_Process;
 // --- Discover WordPress and load environment ---
 $site_root = $site_autoload ? dirname($site_autoload, 2) : dirname(__DIR__);
 Bootstrap::load_dotenv($site_root);
-$wp_load = Bootstrap::discover_wp_load(__DIR__);
 
 // --- Configuration ---
 $socket_path    = Config::socket_path();
