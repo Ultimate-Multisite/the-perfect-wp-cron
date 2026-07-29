@@ -185,18 +185,24 @@ class Worker_Process
 
         if (!$this->is_ready) {
             Worker::log('[SOCKET] Dropping job because the worker is unavailable: ' . $this->failure_reason);
-            $connection->close();
+            $connection->close(json_encode([
+                'accepted' => false,
+                'reason'   => 'worker_unavailable',
+            ]) . "\n");
             return;
         }
 
         try {
             $payload = Job_Payload::from_json($data);
             $this->schedule_timer($payload);
+            $connection->close(json_encode(['accepted' => true]) . "\n");
         } catch (\Throwable $e) {
             Worker::log('[SOCKET] Invalid payload: ' . $e->getMessage());
+            $connection->close(json_encode([
+                'accepted' => false,
+                'reason'   => 'invalid_payload',
+            ]) . "\n");
         }
-
-        $connection->close();
     }
 
     // ------------------------------------------------------------------
