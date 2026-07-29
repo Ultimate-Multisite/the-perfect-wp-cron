@@ -32,15 +32,37 @@ class Socket_Client
 
         $message = $payload->to_json() . "\n";
         $written = fwrite($socket, $message);
-        fclose($socket);
 
         if ($written !== strlen($message)) {
+            fclose($socket);
             self::log_notify_failure($payload, sprintf(
                 'write failed for %s: wrote %d of %d bytes',
                 $path,
                 $written === false ? 0 : $written,
                 strlen($message)
             ));
+            return false;
+        }
+
+        stream_set_timeout($socket, 1);
+        $response = fgets($socket);
+        $meta = stream_get_meta_data($socket);
+        fclose($socket);
+
+        if (!$response) {
+            self::log_notify_failure(
+                $payload,
+                !empty($meta['timed_out']) ? 'timeout waiting for worker response' : 'empty worker response'
+            );
+            return false;
+        }
+
+        $result = json_decode($response, true);
+        if (!is_array($result) || empty($result['accepted'])) {
+            self::log_notify_failure(
+                $payload,
+                'worker rejected job: ' . ($result['reason'] ?? 'malformed response')
+            );
             return false;
         }
 

@@ -350,6 +350,9 @@ namespace {
     $failed_start_job_connection = new Test_Connection();
     $failed_start_worker->on_message($failed_start_job_connection, $payload->to_json());
     assert_true($failed_start_job_connection->closed, 'An unavailable worker must reject queued jobs without crashing');
+    $failed_start_job_response = json_decode((string) $failed_start_job_connection->response, true);
+    assert_same(false, $failed_start_job_response['accepted'] ?? null, 'An unavailable worker must explicitly reject queued jobs');
+    assert_same('worker_unavailable', $failed_start_job_response['reason'] ?? null, 'An unavailable worker rejection must identify its state');
     assert_true(unlink($failed_bootstrap_file), 'Bootstrap failure fixture must be removed');
 
     putenv('QUEUE_WORKER_AS_LANES=' . json_encode([
