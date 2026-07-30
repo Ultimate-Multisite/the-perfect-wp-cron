@@ -27,10 +27,13 @@ $plugin_autoload = dirname(__DIR__) . '/vendor/autoload.php';
 if (file_exists($plugin_autoload)) {
     require_once $plugin_autoload;
 }
+if (!class_exists('QueueWorker\\Bootstrap')) {
+    require_once dirname(__DIR__) . '/src/class-bootstrap.php';
+}
 
 // Discover WordPress before loading the site Composer autoloader. Bedrock's
 // autoloaded plugin files may exit when ABSPATH has not been defined yet.
-$wp_load = Bootstrap::discover_wp_load(__DIR__);
+$wp_load = QueueWorker\Bootstrap::discover_wp_load(__DIR__);
 if (!defined('ABSPATH')) {
     define('ABSPATH', rtrim(dirname($wp_load), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR);
 }

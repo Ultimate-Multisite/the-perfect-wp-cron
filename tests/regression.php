@@ -101,6 +101,17 @@ namespace {
     $GLOBALS['test_site_domain'] = 'example.test';
     $GLOBALS['test_site_path'] = '/';
 
+    $worker_entrypoint = file_get_contents(__DIR__ . '/../bin/worker.php');
+    assert_true(is_string($worker_entrypoint), 'Worker entrypoint must be readable');
+    assert_true(
+        str_contains($worker_entrypoint, 'QueueWorker\\Bootstrap::discover_wp_load'),
+        'Worker entrypoint must fully qualify Bootstrap before namespace imports are declared'
+    );
+    assert_true(
+        str_contains($worker_entrypoint, "require_once dirname(__DIR__) . '/src/class-bootstrap.php'"),
+        'Worker entrypoint must load Bootstrap directly when plugin-local vendor autoload is absent from dist installs'
+    );
+
     class Test_WPDB
     {
         public string $prefix = 'wp_';
