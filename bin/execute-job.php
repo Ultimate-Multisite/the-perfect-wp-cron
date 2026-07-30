@@ -47,6 +47,13 @@ if (file_exists($plugin_autoload)) {
     require_once $plugin_autoload;
 }
 
+// Discover WordPress before loading the site Composer autoloader. Bedrock's
+// autoloaded plugin files may exit when ABSPATH has not been defined yet.
+$wp_load = qw_discover_wp_load(__DIR__);
+if (!defined('ABSPATH')) {
+    define('ABSPATH', rtrim(dirname($wp_load), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR);
+}
+
 // 2. Walk up from plugin root to find site autoloader (Bedrock: has Dotenv, etc.)
 $site_autoload = null;
 $search = dirname(__DIR__);
@@ -70,10 +77,9 @@ use QueueWorker\Bootstrap;
 use QueueWorker\Job_Executor;
 use QueueWorker\Job_Log;
 
-// --- Discover WordPress and load environment ---
+// --- Load environment ---
 $site_root = $site_autoload ? dirname($site_autoload, 2) : dirname(__DIR__);
 Bootstrap::load_dotenv($site_root);
-$wp_load = Bootstrap::discover_wp_load(__DIR__);
 
 // --- Bootstrap WordPress with the target site's domain ---
 $domain = parse_url($payload['site_url'] ?? '', PHP_URL_HOST);
@@ -138,4 +144,32 @@ function qw_payload_matches_sovereign_registry(int $site_id, string $domain): bo
 
     $domains = array_map('strtolower', array_map('strval', $entry['domains'] ?? []));
     return in_array(strtolower($domain), $domains, true);
+}
+
+function qw_discover_wp_load(string $start_dir): string
+{
+    $dir = $start_dir;
+
+    for ($i = 0; $i < 12; $i++) {
+        $candidates = [
+            $dir . '/wp-load.php',
+            $dir . '/web/wp/wp-load.php',
+            $dir . '/web/wp-load.php',
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (file_exists($candidate)) {
+                return $candidate;
+            }
+        }
+
+        $parent = dirname($dir);
+        if ($parent === $dir) {
+            break;
+        }
+        $dir = $parent;
+    }
+
+    fwrite(STDERR, "Could not locate wp-load.php.\n");
+    exit(1);
 }
