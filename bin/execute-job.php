@@ -150,7 +150,7 @@ function qw_discover_wp_load(string $start_dir): string
 {
     $dir = $start_dir;
 
-    for ($i = 0; $i < 12; $i++) {
+    while (true) {
         $candidates = [
             $dir . '/wp-load.php',
             $dir . '/web/wp/wp-load.php',
