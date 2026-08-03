@@ -963,23 +963,71 @@ class Worker_Process
         $exit_code = proc_close($process);
 
         if ($exit_code !== 0) {
-            $message = trim((string) $stderr);
-            Worker::log(sprintf('[RESCAN][SOVEREIGN][FAIL] Site %d scan failed: %s', $site_id, $message));
+            Worker::log(sprintf(
+                '[RESCAN][SOVEREIGN][FAIL] Site %d scan exited with code %d (%s)',
+                $site_id,
+                $exit_code,
+                $this->sovereign_scan_diagnostic('stderr', (string) $stderr)
+            ));
             return;
         }
 
-        $payloads = json_decode((string) $stdout, true);
-        if (!is_array($payloads)) {
-            Worker::log(sprintf('[RESCAN][SOVEREIGN][FAIL] Site %d scan returned invalid JSON', $site_id));
+        if ($stdout === '') {
+            Worker::log(sprintf(
+                '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned empty output (%s)',
+                $site_id,
+                $this->sovereign_scan_diagnostic('stderr', (string) $stderr)
+            ));
+            return;
+        }
+
+        try {
+            $payloads = json_decode($stdout, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            Worker::log(sprintf(
+                '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned invalid JSON (%s; %s; %s)',
+                $site_id,
+                $e->getMessage(),
+                $this->sovereign_scan_diagnostic('stdout', $stdout),
+                $this->sovereign_scan_diagnostic('stderr', (string) $stderr)
+            ));
+            return;
+        }
+
+        if (!array_is_list($payloads)) {
+            Worker::log(sprintf(
+                '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned an invalid payload shape (%s)',
+                $site_id,
+                $this->sovereign_scan_diagnostic('stdout', $stdout)
+            ));
             return;
         }
 
         foreach ($payloads as $payload_data) {
             if (!is_array($payload_data)) {
-                continue;
+                Worker::log(sprintf(
+                    '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned an invalid payload shape (%s)',
+                    $site_id,
+                    $this->sovereign_scan_diagnostic('stdout', $stdout)
+                ));
+                return;
             }
+        }
+
+        foreach ($payloads as $payload_data) {
             $this->schedule_timer(new Job_Payload($payload_data));
         }
+    }
+
+    private function sovereign_scan_diagnostic(string $stream, string $output): string
+    {
+        return sprintf(
+            '%s_bytes=%d %s_sha256=%s',
+            $stream,
+            strlen($output),
+            $stream,
+            substr(hash('sha256', $output), 0, 12)
+        );
     }
 
     private function site_url_from_registry_entry(array $entry): string

@@ -4,9 +4,11 @@ namespace Workerman {
     class Worker
     {
         public int $id = 0;
+        public static array $logs = [];
 
         public static function log(string $message): void
         {
+            self::$logs[] = $message;
         }
 
         public static function stopAll(): void
@@ -387,6 +389,89 @@ namespace {
         'source' => 'action_scheduler',
         'group' => 'checkout',
     ])]), 'AS lane must not match when hook differs');
+
+    $scan_fixture = tempnam(sys_get_temp_dir(), 'qw-sovereign-scan-');
+    assert_true(false !== $scan_fixture, 'Sovereign scan fixture must be created');
+    $sovereign_entry = ['domains' => ['tenant.example.test']];
+    $sovereign_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $scan_fixture);
+
+    assert_true(
+        false !== file_put_contents($scan_fixture, "<?php fwrite(STDOUT, \"bootstrap notice\\n[]\");"),
+        'Noisy sovereign scan fixture must be writable'
+    );
+    \Workerman\Worker::$logs = [];
+    invoke_private($sovereign_worker, 'rescan_sovereign_site_jobs', [7, $sovereign_entry]);
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'returned invalid JSON'),
+        'Noisy subprocess stdout must be rejected instead of scheduling partial jobs'
+    );
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'stdout_bytes='),
+        'Invalid subprocess JSON diagnostics must be bounded to metadata'
+    );
+
+    assert_true(
+        false !== file_put_contents($scan_fixture, '<?php fwrite(STDERR, "sensitive bootstrap detail"); exit(7);'),
+        'Failed sovereign scan fixture must be writable'
+    );
+    \Workerman\Worker::$logs = [];
+    invoke_private($sovereign_worker, 'rescan_sovereign_site_jobs', [7, $sovereign_entry]);
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'exited with code 7'),
+        'Failed subprocesses must report their exit status'
+    );
+    assert_true(
+        !str_contains(implode("\n", \Workerman\Worker::$logs), 'sensitive bootstrap detail'),
+        'Failed subprocess diagnostics must not expose stderr contents'
+    );
+
+    assert_true(
+        false !== file_put_contents($scan_fixture, '<?php'),
+        'Empty-output sovereign scan fixture must be writable'
+    );
+    \Workerman\Worker::$logs = [];
+    invoke_private($sovereign_worker, 'rescan_sovereign_site_jobs', [7, $sovereign_entry]);
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'returned empty output'),
+        'Empty subprocess output must be distinguishable from invalid JSON'
+    );
+
+    assert_true(
+        false !== file_put_contents($scan_fixture, '<?php fwrite(STDOUT, "[null]");'),
+        'Invalid-shape sovereign scan fixture must be writable'
+    );
+    \Workerman\Worker::$logs = [];
+    invoke_private($sovereign_worker, 'rescan_sovereign_site_jobs', [7, $sovereign_entry]);
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'invalid payload shape'),
+        'Malformed payload arrays must not schedule partial jobs'
+    );
+
+    assert_true(
+        false !== file_put_contents($scan_fixture, '<?php fwrite(STDOUT, "[]");'),
+        'Empty-list sovereign scan fixture must be writable'
+    );
+    \Workerman\Worker::$logs = [];
+    invoke_private($sovereign_worker, 'rescan_sovereign_site_jobs', [7, $sovereign_entry]);
+    assert_same([], \Workerman\Worker::$logs, 'A valid empty sovereign scan must not be reported as a failure');
+
+    assert_true(
+        false !== file_put_contents($scan_fixture, '<?php fwrite(STDOUT, "[{\"site_id\":7,\"site_url\":\"https://tenant.example.test\",\"hook\":\"sovereign_hook\",\"args\":[],\"timestamp\":2147483647,\"source\":\"wp_cron\"}]");'),
+        'Valid sovereign scan fixture must be writable'
+    );
+    \Workerman\Timer::$delays = [];
+    \Workerman\Worker::$logs = [];
+    invoke_private($sovereign_worker, 'rescan_sovereign_site_jobs', [7, $sovereign_entry]);
+    assert_same(1, count(\Workerman\Timer::$delays), 'Valid sovereign payload arrays must continue to schedule normally');
+    assert_same([], \Workerman\Worker::$logs, 'Valid sovereign payload arrays must not be reported as failures');
+
+    $scan_script = file_get_contents(__DIR__ . '/../bin/scan-cron.php');
+    assert_true(is_string($scan_script), 'Sovereign scan script must be readable');
+    assert_true(
+        str_contains($scan_script, '$stdout_buffer_level = ob_get_level();') && str_contains($scan_script, 'JSON_THROW_ON_ERROR'),
+        'Sovereign scan script must isolate bootstrap output and fail safely when encoding JSON'
+    );
+    assert_true(unlink($scan_fixture), 'Sovereign scan fixture must be removed');
 
     \Workerman\Timer::$delays = [];
     $registry_content_dir = sys_get_temp_dir() . '/qw-regression-content-' . getmypid();
