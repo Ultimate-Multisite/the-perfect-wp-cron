@@ -76,6 +76,28 @@ namespace {
             $this->response = $response;
         }
     }
+
+    class Test_WP_Error
+    {
+        private string $code;
+        private string $message;
+
+        public function __construct(string $code, string $message)
+        {
+            $this->code    = $code;
+            $this->message = $message;
+        }
+
+        public function get_error_code(): string
+        {
+            return $this->code;
+        }
+
+        public function get_error_message(): string
+        {
+            return $this->message;
+        }
+    }
 }
 
 namespace {
@@ -96,6 +118,9 @@ namespace {
     $GLOBALS['test_unscheduled_events'] = [];
     $GLOBALS['test_rescheduled_events'] = [];
     $GLOBALS['test_reschedule_result'] = true;
+    $GLOBALS['test_schedules'] = [
+        'hourly' => ['interval' => 3600],
+    ];
     $GLOBALS['test_fired_actions'] = [];
     $GLOBALS['test_cache_deletes'] = [];
     $GLOBALS['test_ms_switched'] = false;
@@ -178,9 +203,7 @@ namespace {
 
     function wp_get_schedules(): array
     {
-        return [
-            'hourly' => ['interval' => 3600],
-        ];
+        return $GLOBALS['test_schedules'];
     }
 
     function get_sites(array $args): array
@@ -274,14 +297,16 @@ namespace {
             'args'      => $args,
         ];
 
+        if ($GLOBALS['test_reschedule_result'] === true && !isset($GLOBALS['test_schedules'][$schedule])) {
+            return new Test_WP_Error('invalid_schedule', 'The schedule does not exist.');
+        }
+
         return $GLOBALS['test_reschedule_result'];
     }
 
     function is_wp_error($thing): bool
     {
-        unset($thing);
-
-        return false;
+        return $thing instanceof Test_WP_Error;
     }
 
     function do_action_ref_array(string $hook, array $args): void
@@ -624,6 +649,79 @@ namespace {
     assert_same([], $GLOBALS['test_rescheduled_events'], 'A stale recurring duplicate must not reschedule when any later equivalent event exists');
     assert_true(!isset($GLOBALS['test_crons'][$recurring_timestamp]), 'A stale recurring duplicate must be removed after its successor is confirmed');
     assert_true(isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_hook'][$recurring_key]), 'The authoritative recurring successor must remain scheduled');
+
+    $orphaned_timestamp = time() - 3600;
+    $orphaned_job = [
+        'hook'      => 'orphaned_recurring_hook',
+        'args'      => ['site_id' => 7],
+        'timestamp' => $orphaned_timestamp,
+        'schedule'  => 'unavailable_cleanup',
+    ];
+    $GLOBALS['test_schedules'] = [];
+    $GLOBALS['test_crons'] = [
+        $orphaned_timestamp => [
+            'orphaned_recurring_hook' => [
+                $recurring_key => ['schedule' => 'unavailable_cleanup', 'args' => ['site_id' => 7], 'interval' => 3600],
+            ],
+        ],
+    ];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_rescheduled_events'] = [];
+    $GLOBALS['test_reschedule_result'] = true;
+    try {
+        invoke_private($executor, 'execute_wp_cron', [$orphaned_job]);
+        throw new RuntimeException('Unavailable recurrences must report their removal');
+    } catch (RuntimeException $exception) {
+        assert_true(str_contains($exception->getMessage(), 'Removed orphaned cron event'), 'Unavailable recurrences must be reported as orphaned cleanup');
+    }
+    assert_same([], $GLOBALS['test_fired_actions'], 'An orphaned recurring event must not fire its callback');
+    assert_same(1, count($GLOBALS['test_rescheduled_events']), 'An orphaned recurring event must identify the invalid schedule through WordPress');
+    assert_same([], $GLOBALS['test_crons'], 'An orphaned recurring event must be removed instead of retrying indefinitely');
+
+    $GLOBALS['test_schedules'] = [
+        'unavailable_cleanup' => ['interval' => 3600],
+        'hourly'               => ['interval' => 3600],
+    ];
+    $GLOBALS['test_crons'] = [
+        $orphaned_timestamp => [
+            'orphaned_recurring_hook' => [
+                $recurring_key => ['schedule' => 'unavailable_cleanup', 'args' => ['site_id' => 7], 'interval' => 3600],
+            ],
+        ],
+    ];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_rescheduled_events'] = [];
+    invoke_private($executor, 'execute_wp_cron', [$orphaned_job]);
+    assert_same([
+        ['hook' => 'orphaned_recurring_hook', 'args' => ['site_id' => 7]],
+    ], $GLOBALS['test_fired_actions'], 'A recurring event must resume normal execution after its provider returns');
+    assert_same([], $GLOBALS['test_crons'], 'A recovered recurring event must remove its executed row after rescheduling');
+
+    $failure_timestamp = time() - 1800;
+    $failure_job = [
+        'hook'      => 'failing_recurring_hook',
+        'args'      => [],
+        'timestamp' => $failure_timestamp,
+        'schedule'  => 'hourly',
+    ];
+    $GLOBALS['test_crons'] = [
+        $failure_timestamp => [
+            'failing_recurring_hook' => [
+                md5(serialize([])) => ['schedule' => 'hourly', 'args' => [], 'interval' => 3600],
+            ],
+        ],
+    ];
+    $GLOBALS['test_fired_actions'] = [];
+    $GLOBALS['test_reschedule_result'] = false;
+    try {
+        invoke_private($executor, 'execute_wp_cron', [$failure_job]);
+        throw new RuntimeException('Non-invalid-schedule rescheduling failures must remain visible');
+    } catch (RuntimeException $exception) {
+        assert_true(str_contains($exception->getMessage(), 'Failed to reschedule cron event'), 'Non-invalid-schedule rescheduling failures must remain visible');
+    }
+    assert_same([], $GLOBALS['test_fired_actions'], 'A recurring event with a transient rescheduling failure must not fire its callback');
+    assert_true(isset($GLOBALS['test_crons'][$failure_timestamp]['failing_recurring_hook']), 'A recurring event with a transient rescheduling failure must remain available for retry');
+    $GLOBALS['test_reschedule_result'] = true;
 
     $malformed_successor_key = 'malformed-successor-key';
     $GLOBALS['test_crons'] = [
