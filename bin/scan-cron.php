@@ -25,6 +25,12 @@ if (!is_array($payload)) {
     exit(1);
 }
 
+// WordPress and plugins can emit notices while bootstrapping. The parent
+// process consumes stdout as a JSON-only protocol, so keep every incidental
+// byte out of that stream until the payload is ready to write.
+$stdout_buffer_level = ob_get_level();
+ob_start();
+
 // --- Load QueueWorker classes ---
 $plugin_autoload = dirname(__DIR__) . '/vendor/autoload.php';
 if (file_exists($plugin_autoload)) {
@@ -131,7 +137,29 @@ if (function_exists('as_get_scheduled_actions') && qw_scan_action_scheduler_tabl
     }
 }
 
-echo json_encode($payloads);
+// A plugin can leave nested output buffers open. Discard every buffer opened
+// during this scan before writing the protocol response to real stdout.
+$incidental_output = '';
+while (ob_get_level() > $stdout_buffer_level) {
+    $incidental_output .= (string) ob_get_clean();
+}
+
+if ($incidental_output !== '') {
+    fwrite(STDERR, sprintf(
+        "Suppressed %d bytes of bootstrap output (sha256:%s).\n",
+        strlen($incidental_output),
+        substr(hash('sha256', $incidental_output), 0, 12)
+    ));
+}
+
+try {
+    $encoded_payloads = json_encode($payloads, JSON_THROW_ON_ERROR);
+} catch (\JsonException $e) {
+    fwrite(STDERR, sprintf("Could not encode scan payload: %s.\n", $e->getMessage()));
+    exit(1);
+}
+
+fwrite(STDOUT, $encoded_payloads);
 
 function qw_scan_action_scheduler_tables_exist(): bool
 {
