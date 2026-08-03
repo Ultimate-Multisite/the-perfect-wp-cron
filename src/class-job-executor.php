@@ -127,6 +127,14 @@ class Job_Executor
 
             $rescheduled = wp_reschedule_event($timestamp, $schedule, $hook, $args, true);
 
+            if (is_wp_error($rescheduled) && $rescheduled->get_error_code() === 'invalid_schedule') {
+                if (!$this->unschedule_cron_event($timestamp, $hook, $args)) {
+                    throw new \RuntimeException(sprintf('Failed to remove orphaned cron event %s at %d', $hook, $timestamp));
+                }
+
+                throw new \RuntimeException(sprintf('Removed orphaned cron event %s at %d because recurrence %s is unavailable', $hook, $timestamp, $schedule));
+            }
+
             if ($rescheduled !== true) {
                 $reason = is_wp_error($rescheduled) ? $rescheduled->get_error_message() : 'unknown error';
                 throw new \RuntimeException(sprintf('Failed to reschedule cron event %s at %d: %s', $hook, $timestamp, $reason));
