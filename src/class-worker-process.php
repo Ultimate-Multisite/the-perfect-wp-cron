@@ -66,6 +66,8 @@ class Worker_Process
     private int $last_rescan_duration = 0;
     private bool $is_ready = false;
     private string $failure_reason = '';
+    /** @var array<int, true> */
+    private array $unroutable_sites_logged = [];
 
     public function __construct(string $wp_load, string $primary_domain, string $execute_script, string $scan_script = '')
     {
@@ -242,6 +244,17 @@ class Worker_Process
      */
     private function schedule_timer(Job_Payload $payload): void
     {
+        if ($payload->site_url === '') {
+            if (!isset($this->unroutable_sites_logged[$payload->site_id])) {
+                Worker::log(sprintf(
+                    '[SKIP][UNROUTABLE] Site %d has no uniquely owned bootstrap domain; jobs remain pending until routing metadata is repaired.',
+                    $payload->site_id
+                ));
+                $this->unroutable_sites_logged[$payload->site_id] = true;
+            }
+            return;
+        }
+
         $key = $payload->tracking_key();
         if (isset($this->pending_timers[$key])) {
             return;

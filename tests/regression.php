@@ -127,6 +127,9 @@ namespace {
     $GLOBALS['test_site_url'] = 'https://example.test';
     $GLOBALS['test_site_domain'] = 'example.test';
     $GLOBALS['test_site_path'] = '/';
+    $GLOBALS['test_mapping_table_exists'] = false;
+    $GLOBALS['test_mapping_row'] = null;
+    $GLOBALS['test_canonical_mapping_conflicts'] = 0;
 
     $worker_entrypoint = file_get_contents(__DIR__ . '/../bin/worker.php');
     assert_true(is_string($worker_entrypoint), 'Worker entrypoint must be readable');
@@ -158,7 +161,19 @@ namespace {
 
         public function get_var(string $query): ?string
         {
+            if (str_contains($query, 'SHOW TABLES LIKE') && str_contains($query, 'wu_domain_mappings')) {
+                return $GLOBALS['test_mapping_table_exists'] ? 'wp_wu_domain_mappings' : null;
+            }
+            if (str_contains($query, 'COUNT(*)') && str_contains($query, 'wu_domain_mappings')) {
+                return (string) $GLOBALS['test_canonical_mapping_conflicts'];
+            }
             return null;
+        }
+
+        public function get_row(string $query): ?object
+        {
+            unset($query);
+            return $GLOBALS['test_mapping_row'];
         }
 
         public function query(string $query)
@@ -541,6 +556,39 @@ namespace {
         $switched_cron_payload->site_url,
         'WP-Cron factory payloads must preserve the canonical switched-site bootstrap URL'
     );
+    $GLOBALS['test_mapping_table_exists'] = true;
+    $GLOBALS['test_mapping_row'] = (object) [
+        'domain' => 'translate.example.test',
+        'secure' => '1',
+    ];
+    $mapped_payload = new Job_Payload([
+        'hook' => 'mapped_site_hook',
+        'timestamp' => 1710000000,
+        'source' => 'action_scheduler',
+        'action_id' => 47,
+    ]);
+    assert_same(
+        'https://translate.example.test/translations/',
+        $mapped_payload->site_url,
+        'Payload URL must prefer a uniquely owned active domain mapping'
+    );
+
+    $GLOBALS['test_mapping_row'] = null;
+    $GLOBALS['test_canonical_mapping_conflicts'] = 1;
+    $unroutable_payload = new Job_Payload([
+        'hook' => 'unroutable_site_hook',
+        'timestamp' => 1710000000,
+        'source' => 'action_scheduler',
+        'action_id' => 48,
+    ]);
+    assert_same('', $unroutable_payload->site_url, 'A canonical domain mapped to another blog must fail closed');
+    \Workerman\Worker::$logs = [];
+    invoke_private($worker, 'schedule_timer', [$unroutable_payload]);
+    invoke_private($worker, 'schedule_timer', [$unroutable_payload]);
+    assert_same(1, count(\Workerman\Worker::$logs), 'An unroutable site must be skipped with one bounded diagnostic');
+
+    $GLOBALS['test_mapping_table_exists'] = false;
+    $GLOBALS['test_canonical_mapping_conflicts'] = 0;
     restore_current_blog();
     $GLOBALS['test_site_url'] = 'https://example.test';
     $GLOBALS['test_site_domain'] = 'example.test';
