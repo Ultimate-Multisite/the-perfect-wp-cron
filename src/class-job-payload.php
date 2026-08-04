@@ -174,8 +174,8 @@ class Job_Payload
      * During a full-network scan, get_site_url() can be filtered to a mapped,
      * stale, or secondary-network domain. Bootstrapping a fresh executor with
      * that URL can select a different routed database before switch_to_blog()
-     * runs. The wp_blogs domain and path are authoritative for switched-site
-     * scans because WordPress resolves them to the same blog the scanner read.
+     * runs. Prefer a uniquely owned active domain mapping. Fall back to the
+     * wp_blogs domain only when another blog has not claimed it.
      */
     private static function current_site_url(): string
     {
@@ -202,6 +202,80 @@ class Job_Payload
             $path = '/' . $path;
         }
 
+        $site_id = get_current_blog_id();
+        $mapped_url = self::current_mapped_site_url($site_id, $path, $scheme === 'https');
+        if ($mapped_url !== '') {
+            return $mapped_url;
+        }
+
+        if (self::canonical_domain_is_mapped_elsewhere((string) $site->domain, $site_id)) {
+            return '';
+        }
+
         return $scheme . '://' . (string) $site->domain . $path;
+    }
+
+    /**
+     * Return a uniquely owned active mapping for a switched blog.
+     */
+    private static function current_mapped_site_url(int $site_id, string $path, bool $secure): string
+    {
+        global $wpdb;
+
+        $table = $wpdb->base_prefix . 'wu_domain_mappings';
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+            return '';
+        }
+
+        $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+        if ($found !== $table) {
+            return '';
+        }
+
+        $sql = 'SELECT candidate.domain, candidate.secure FROM `' . $table . '` candidate '
+            . 'WHERE candidate.blog_id = %d AND candidate.active = 1 '
+            . 'AND NOT EXISTS (SELECT 1 FROM `' . $table . '` conflict '
+            . 'WHERE conflict.domain = candidate.domain AND conflict.active = 1 '
+            . 'AND conflict.blog_id <> candidate.blog_id) '
+            . 'ORDER BY candidate.primary_domain DESC, candidate.id DESC LIMIT 1';
+        $mapping = $wpdb->get_row($wpdb->prepare($sql, $site_id));
+        if (!is_object($mapping) || empty($mapping->domain)) {
+            return '';
+        }
+
+        $domain = strtolower(rtrim(trim((string) $mapping->domain), '.'));
+        if (preg_match('/^[a-z0-9.-]+(?::[0-9]+)?$/', $domain) !== 1) {
+            return '';
+        }
+
+        return (!empty($mapping->secure) || $secure ? 'https://' : 'http://') . $domain . $path;
+    }
+
+    /**
+     * Check whether a canonical domain is actively mapped to another blog.
+     */
+    private static function canonical_domain_is_mapped_elsewhere(string $domain, int $site_id): bool
+    {
+        global $wpdb;
+
+        $table = $wpdb->base_prefix . 'wu_domain_mappings';
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+            return false;
+        }
+
+        $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table)));
+        if ($found !== $table) {
+            return false;
+        }
+
+        $sql = 'SELECT COUNT(*) FROM `' . $table . '` '
+            . 'WHERE domain = %s AND active = 1 AND blog_id <> %d';
+        $conflicts = $wpdb->get_var($wpdb->prepare(
+            $sql,
+            strtolower(rtrim(trim($domain), '.')),
+            $site_id
+        ));
+
+        return (int) $conflicts > 0;
     }
 }
