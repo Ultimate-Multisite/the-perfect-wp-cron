@@ -142,6 +142,25 @@ namespace {
         'Worker entrypoint must load Bootstrap directly when plugin-local vendor autoload is absent from dist installs'
     );
 
+    $executor_entrypoint = file_get_contents(__DIR__ . '/../bin/execute-job.php');
+    assert_true(is_string($executor_entrypoint), 'Executor entrypoint must be readable');
+    assert_true(
+        str_contains($executor_entrypoint, "define('QUEUE_WORKER_EXECUTOR_RUNNING', true)"),
+        'Executor subprocesses must identify themselves before WordPress loads'
+    );
+
+    $plugin_entrypoint = file_get_contents(__DIR__ . '/../the-perfect-wp-cron.php');
+    assert_true(is_string($plugin_entrypoint), 'Plugin entrypoint must be readable');
+    assert_true(
+        str_contains($plugin_entrypoint, 'if ($queue_worker_running && !$job_executor_running)'),
+        'Only non-executor worker processes may skip cron interceptor registration'
+    );
+    assert_true(
+        strpos($plugin_entrypoint, "add_action('init', ['QueueWorker\\\\Cron_Interceptor', 'register'])")
+            < strpos($plugin_entrypoint, 'if ($job_executor_running)'),
+        'Executor subprocesses must register scheduling interceptors before stopping normal plugin bootstrap'
+    );
+
     class Test_WPDB
     {
         public string $prefix = 'wp_';

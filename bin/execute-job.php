@@ -95,6 +95,7 @@ $_SERVER['HTTPS']          = 'on';
 $_SERVER['REQUEST_METHOD'] = 'GET';
 
 define('QUEUE_WORKER_RUNNING', true);
+define('QUEUE_WORKER_EXECUTOR_RUNNING', true);
 if (!defined('DOING_CRON')) {
     define('DOING_CRON', true);
 }

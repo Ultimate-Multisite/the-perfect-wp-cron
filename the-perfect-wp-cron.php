@@ -25,14 +25,23 @@ if (!class_exists('QueueWorker\\Config')) {
     require_once __DIR__ . '/vendor/autoload.php';
 }
 
-// Don't register interceptors inside the worker process itself
-if (defined('QUEUE_WORKER_RUNNING') && QUEUE_WORKER_RUNNING) {
+// The long-running worker and scanner must not intercept their own bootstrap
+// activity. Job executor subprocesses do need the interceptors so cron events
+// scheduled by callbacks are sent straight back to the parent worker.
+$queue_worker_running = defined('QUEUE_WORKER_RUNNING') && QUEUE_WORKER_RUNNING;
+$job_executor_running = defined('QUEUE_WORKER_EXECUTOR_RUNNING') && QUEUE_WORKER_EXECUTOR_RUNNING;
+
+if ($queue_worker_running && !$job_executor_running) {
     return;
 }
 
 add_action('init', ['QueueWorker\\Cron_Interceptor', 'register']);
 QueueWorker\Action_Scheduler_Bridge::register_stored_action_hook();
 add_action('action_scheduler_init', ['QueueWorker\\Action_Scheduler_Bridge', 'register']);
+
+if ($job_executor_running) {
+    return;
+}
 
 // Admin menu
 $menu_hook = is_multisite() ? 'network_admin_menu' : 'admin_menu';
