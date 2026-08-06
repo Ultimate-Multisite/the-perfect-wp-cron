@@ -167,6 +167,8 @@ namespace {
         public string $base_prefix = 'wp_';
         public array $queries = [];
         public array $query_results = [];
+        public array $cron_site_locks = [];
+        public array $expired_cron_site_locks = [];
 
         public function prepare(string $query, ...$args): string
         {
@@ -180,6 +182,9 @@ namespace {
 
         public function get_var(string $query): ?string
         {
+            if (preg_match('/SELECT owner_token FROM `wp_qw_cron_site_locks` WHERE site_id = ([0-9]+)/', $query, $matches)) {
+                return $this->cron_site_locks[(int) $matches[1]] ?? null;
+            }
             if (str_contains($query, 'SHOW TABLES LIKE') && str_contains($query, 'wu_domain_mappings')) {
                 return $GLOBALS['test_mapping_table_exists'] ? 'wp_wu_domain_mappings' : null;
             }
@@ -198,6 +203,35 @@ namespace {
         public function query(string $query)
         {
             $this->queries[] = $query;
+
+            if (str_contains($query, 'qw_cron_site_locks')) {
+                if (str_starts_with($query, 'CREATE TABLE')) {
+                    return 1;
+                }
+                if (preg_match("/INSERT INTO `wp_qw_cron_site_locks` .*VALUES \\(([0-9]+), '([a-f0-9]+)'/", $query, $matches)) {
+                    $site_id = (int) $matches[1];
+                    if (isset($this->cron_site_locks[$site_id]) && empty($this->expired_cron_site_locks[$site_id])) {
+                        // Emulate a client using CLIENT_FOUND_ROWS, where a
+                        // no-op duplicate-key update can report one row.
+                        return 1;
+                    }
+                    $this->cron_site_locks[$site_id] = $matches[2];
+                    unset($this->expired_cron_site_locks[$site_id]);
+                    return 1;
+                }
+                if (preg_match("/UPDATE `wp_qw_cron_site_locks` .*WHERE site_id = ([0-9]+) AND owner_token = '([a-f0-9]+)'/", $query, $matches)) {
+                    $site_id = (int) $matches[1];
+                    return ($this->cron_site_locks[$site_id] ?? '') === $matches[2] ? 1 : 0;
+                }
+                if (preg_match("/DELETE FROM `wp_qw_cron_site_locks` WHERE site_id = ([0-9]+) AND owner_token = '([a-f0-9]+)'/", $query, $matches)) {
+                    $site_id = (int) $matches[1];
+                    if (($this->cron_site_locks[$site_id] ?? '') !== $matches[2]) {
+                        return 0;
+                    }
+                    unset($this->cron_site_locks[$site_id]);
+                    return 1;
+                }
+            }
 
             return $this->query_results === [] ? 1 : array_shift($this->query_results);
         }
@@ -373,6 +407,13 @@ namespace {
         return $reflection->getValue($object);
     }
 
+    function set_private_property(object $object, string $property, mixed $value): void
+    {
+        $reflection = new ReflectionProperty($object, $property);
+        $reflection->setAccessible(true);
+        $reflection->setValue($object, $value);
+    }
+
     function invoke_private(object $object, string $method, array $args = [])
     {
         $reflection = new ReflectionMethod($object, $method);
@@ -402,7 +443,49 @@ namespace {
     ]);
     $decoded = json_decode($payload->to_json(), true);
     assert_same('checkout', $decoded['group'], 'Action Scheduler group must be serialized');
-    assert_true(str_contains($payload->tracking_key(), ':checkout:'), 'Action Scheduler group must be part of the tracking key');
+    assert_same('action_scheduler:7:44', $payload->tracking_key(), 'Action Scheduler identity must use its durable action ID');
+    $same_action_different_route = new Job_Payload([
+        'site_id'   => 7,
+        'site_url'  => 'https://alternate.example.test',
+        'hook'      => 'changed_transport_hook',
+        'args'      => ['changed' => true],
+        'timestamp' => 1710000100,
+        'source'    => 'action_scheduler',
+        'action_id' => 44,
+        'group'     => 'alternate',
+    ]);
+    assert_same($payload->tracking_key(), $same_action_different_route->tracking_key(), 'Action Scheduler identity must not depend on routing metadata');
+    $different_action = new Job_Payload([
+        'site_id'   => 7,
+        'site_url'  => 'https://tenant.example.test',
+        'hook'      => 'as_hook',
+        'args'      => ['order_id' => 123],
+        'timestamp' => 1710000000,
+        'source'    => 'action_scheduler',
+        'action_id' => 45,
+        'group'     => 'checkout',
+    ]);
+    assert_true($payload->tracking_key() !== $different_action->tracking_key(), 'Distinct Action Scheduler actions must not collapse');
+
+    $cron_route_a = new Job_Payload([
+        'site_id'   => 7,
+        'site_url'  => 'https://tenant.example.test',
+        'hook'      => 'route_independent_hook',
+        'args'      => ['batch' => 1],
+        'timestamp' => 2147483647,
+        'schedule'  => 'hourly',
+        'source'    => 'wp_cron',
+    ]);
+    $cron_route_b = new Job_Payload([
+        'site_id'   => 7,
+        'site_url'  => 'https://mapped.example.test',
+        'hook'      => 'route_independent_hook',
+        'args'      => ['batch' => 1],
+        'timestamp' => 2147483647,
+        'schedule'  => 'hourly',
+        'source'    => 'wp_cron',
+    ]);
+    assert_same($cron_route_a->tracking_key(), $cron_route_b->tracking_key(), 'WP-Cron identity must not depend on its bootstrap URL');
 
     $failed_bootstrap_file = tempnam(sys_get_temp_dir(), 'qw-bootstrap-failure-');
     assert_true(false !== $failed_bootstrap_file, 'Bootstrap failure fixture must be created');
@@ -438,6 +521,65 @@ namespace {
         ],
     ]));
     $worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
+    $identity_worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
+    invoke_private($identity_worker, 'schedule_timer', [$cron_route_a]);
+    invoke_private($identity_worker, 'schedule_timer', [$cron_route_b]);
+    assert_same(1, count(private_property($identity_worker, 'pending_timers')), 'Route variants of one WP-Cron event must collapse to one timer');
+
+    Worker_Process::ensure_lock_table();
+    assert_true(
+        str_contains(implode("\n", $GLOBALS['wpdb']->queries), 'CREATE TABLE IF NOT EXISTS `wp_qw_cron_site_locks`'),
+        'Worker startup must provision the shared per-site cron lock table'
+    );
+    $site_7_owner = invoke_private($worker, 'claim_cron_site_lock', [7]);
+    assert_true(is_string($site_7_owner) && $site_7_owner !== '', 'The first worker must claim a site cron lease');
+    $second_worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
+    assert_same(null, invoke_private($second_worker, 'claim_cron_site_lock', [7]), 'A second worker must not claim an active lease for the same site');
+    $site_8_owner = invoke_private($second_worker, 'claim_cron_site_lock', [8]);
+    assert_true(is_string($site_8_owner) && $site_8_owner !== '', 'Different sites must retain parallel cron execution');
+    assert_same(true, invoke_private($worker, 'refresh_cron_site_lock', [7, $site_7_owner]), 'The owning worker must refresh its cron site lease');
+    $GLOBALS['wpdb']->expired_cron_site_locks[7] = true;
+    $replacement_site_7_owner = invoke_private($second_worker, 'claim_cron_site_lock', [7]);
+    assert_true(
+        is_string($replacement_site_7_owner) && $replacement_site_7_owner !== $site_7_owner,
+        'Another worker must be able to replace an expired site lease'
+    );
+    assert_same(false, invoke_private($worker, 'refresh_cron_site_lock', [7, $site_7_owner]), 'A stale owner must not refresh a replaced site lease');
+    invoke_private($worker, 'release_cron_site_lock', [7, $site_7_owner]);
+    assert_same(null, invoke_private($worker, 'claim_cron_site_lock', [7]), 'A stale owner must not release another worker\'s site lease');
+
+    $lease_process = proc_open(PHP_BINARY . ' -r ' . escapeshellarg('sleep(5);'), [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ], $lease_pipes);
+    assert_true(is_resource($lease_process), 'Lease-renewal failure fixture must start a subprocess');
+    fclose($lease_pipes[0]);
+    stream_set_blocking($lease_pipes[1], false);
+    stream_set_blocking($lease_pipes[2], false);
+    set_private_property($worker, 'running_processes', [[
+        'process'                  => $lease_process,
+        'pipes'                    => $lease_pipes,
+        'payloads'                 => [$payload],
+        'started'                  => time(),
+        'stdout'                   => '',
+        'stderr'                   => '',
+        'lane'                     => 'wp_cron',
+        'cron_site_lock_owner'     => $site_7_owner,
+        'cron_site_lock_refreshed' => time() - 61,
+    ]]);
+    set_private_property($worker, 'running_jobs', 1);
+    invoke_private($worker, 'poll_processes', [0]);
+    assert_same([], private_property($worker, 'running_processes'), 'A batch must be reaped when its cron site lease cannot be renewed');
+    assert_same(0, private_property($worker, 'running_jobs'), 'A reaped batch must no longer count as running');
+    assert_same($replacement_site_7_owner, $GLOBALS['wpdb']->cron_site_locks[7] ?? null, 'A stale worker must not delete the replacement site lease');
+
+    invoke_private($second_worker, 'release_cron_site_lock', [7, $replacement_site_7_owner]);
+    $reclaimed_site_7_owner = invoke_private($worker, 'claim_cron_site_lock', [7]);
+    assert_true(is_string($reclaimed_site_7_owner) && $reclaimed_site_7_owner !== '', 'A completed batch must release the site for the next worker');
+    invoke_private($worker, 'release_cron_site_lock', [7, $reclaimed_site_7_owner]);
+    invoke_private($second_worker, 'release_cron_site_lock', [8, $site_8_owner]);
+
     assert_same('checkout_lane', invoke_private($worker, 'action_scheduler_lane_for', [$payload]), 'AS lane must match by site, group, and hook');
     assert_same('action_scheduler', invoke_private($worker, 'action_scheduler_lane_for', [new Job_Payload([
         'site_id' => 7,

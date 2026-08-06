@@ -203,11 +203,13 @@ WordPress Request                    Worker Process (Workerman)
                                                     |
                                         Timer triggers at scheduled time
                                                     |
-                                        Claim job (INSERT IGNORE lock)
-                                                    |
-                                          Batch by site_id
-                                                    |
-                                     +------------------------------+
+                                         Claim job (INSERT IGNORE lock)
+                                                     |
+                                           Batch by site_id
+                                                     |
+                                  Acquire per-site WP-Cron execution lease
+                                                     |
+                                      +------------------------------+
                                      | Subprocess: execute-job.php  |
                                      |   Bootstrap WP for site      |
                                      |   For each job in batch:     |
@@ -222,9 +224,9 @@ WordPress Request                    Worker Process (Workerman)
 2. The plugin intercepts the schedule call and sends a JSON payload to the worker via Unix socket.
 3. The worker sets a Workerman timer for the job's exact timestamp.
 4. When the timer triggers, the worker atomically claims the job via `INSERT IGNORE` into a lock table (prevents duplicate execution across workers).
-5. Claimed jobs are batched by `site_id` and flushed to a subprocess every second.
+5. Claimed jobs are batched by `site_id` and flushed to a subprocess every second. WP-Cron batches acquire a shared per-site lease so separate worker processes cannot update one site's cron option concurrently.
 6. The subprocess (`execute-job.php`) bootstraps WordPress for the target site's domain, executes each job with a per-job SIGALRM timeout, logs results to the `qw_job_log` table, and exits.
-7. The worker polls subprocesses for completion and logs batch results.
+7. The worker polls subprocesses for completion, refreshes active site leases, and logs batch results.
 8. A periodic database rescan catches any jobs that arrived before the worker started or bypassed socket notification.
 
 ## Troubleshooting
