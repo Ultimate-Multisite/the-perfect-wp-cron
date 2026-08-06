@@ -407,6 +407,13 @@ namespace {
         return $reflection->getValue($object);
     }
 
+    function set_private_property(object $object, string $property, mixed $value): void
+    {
+        $reflection = new ReflectionProperty($object, $property);
+        $reflection->setAccessible(true);
+        $reflection->setValue($object, $value);
+    }
+
     function invoke_private(object $object, string $method, array $args = [])
     {
         $reflection = new ReflectionMethod($object, $method);
@@ -540,6 +547,33 @@ namespace {
     assert_same(false, invoke_private($worker, 'refresh_cron_site_lock', [7, $site_7_owner]), 'A stale owner must not refresh a replaced site lease');
     invoke_private($worker, 'release_cron_site_lock', [7, $site_7_owner]);
     assert_same(null, invoke_private($worker, 'claim_cron_site_lock', [7]), 'A stale owner must not release another worker\'s site lease');
+
+    $lease_process = proc_open(PHP_BINARY . ' -r ' . escapeshellarg('sleep(5);'), [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ], $lease_pipes);
+    assert_true(is_resource($lease_process), 'Lease-renewal failure fixture must start a subprocess');
+    fclose($lease_pipes[0]);
+    stream_set_blocking($lease_pipes[1], false);
+    stream_set_blocking($lease_pipes[2], false);
+    set_private_property($worker, 'running_processes', [[
+        'process'                  => $lease_process,
+        'pipes'                    => $lease_pipes,
+        'payloads'                 => [$payload],
+        'started'                  => time(),
+        'stdout'                   => '',
+        'stderr'                   => '',
+        'lane'                     => 'wp_cron',
+        'cron_site_lock_owner'     => $site_7_owner,
+        'cron_site_lock_refreshed' => time() - 61,
+    ]]);
+    set_private_property($worker, 'running_jobs', 1);
+    invoke_private($worker, 'poll_processes', [0]);
+    assert_same([], private_property($worker, 'running_processes'), 'A batch must be reaped when its cron site lease cannot be renewed');
+    assert_same(0, private_property($worker, 'running_jobs'), 'A reaped batch must no longer count as running');
+    assert_same($replacement_site_7_owner, $GLOBALS['wpdb']->cron_site_locks[7] ?? null, 'A stale worker must not delete the replacement site lease');
+
     invoke_private($second_worker, 'release_cron_site_lock', [7, $replacement_site_7_owner]);
     $reclaimed_site_7_owner = invoke_private($worker, 'claim_cron_site_lock', [7]);
     assert_true(is_string($reclaimed_site_7_owner) && $reclaimed_site_7_owner !== '', 'A completed batch must release the site for the next worker');

@@ -13,8 +13,8 @@ use Workerman\Timer;
  */
 class Worker_Process
 {
-    private const CRON_SITE_LOCK_TTL_SECONDS = 360;
-    private const CRON_SITE_LOCK_REFRESH_SECONDS = 60;
+    private const QW_CRON_SITE_LOCK_TTL_SECONDS = 360;
+    private const QW_CRON_SITE_LOCK_REFRESH_SECONDS = 60;
 
     /** @var string Absolute path to wp-load.php */
     private string $wp_load;
@@ -735,9 +735,21 @@ class Worker_Process
         foreach ($this->running_processes as $i => $proc) {
             $cron_site_lock_owner = $proc['cron_site_lock_owner'];
             $lock_refreshed = $proc['cron_site_lock_refreshed'];
-            if ($cron_site_lock_owner !== '' && time() - $lock_refreshed >= self::CRON_SITE_LOCK_REFRESH_SECONDS) {
+            if ($cron_site_lock_owner !== '' && time() - $lock_refreshed >= self::QW_CRON_SITE_LOCK_REFRESH_SECONDS) {
                 if ($this->refresh_cron_site_lock($proc['payloads'][0]->site_id, $cron_site_lock_owner)) {
                     $this->running_processes[$i]['cron_site_lock_refreshed'] = time();
+                } else {
+                    $this->terminate_and_reap_process($proc);
+                    Worker::log(sprintf(
+                        '[W%d][LOCK][LOST] Batch: %d jobs on site %d lost its cron site lease',
+                        $worker_id,
+                        count($proc['payloads']),
+                        $proc['payloads'][0]->site_id
+                    ));
+                    $this->release_running_cron_site_lock($proc);
+                    unset($this->running_processes[$i]);
+                    $this->running_jobs--;
+                    continue;
                 }
             }
 
@@ -808,10 +820,7 @@ class Worker_Process
             if (time() - $proc['started'] > $this->batch_timeout) {
                 $payloads = $proc['payloads'];
                 $pid = $status['pid'];
-                proc_terminate($proc['process'], 9);
-                fclose($proc['pipes'][1]);
-                fclose($proc['pipes'][2]);
-                proc_close($proc['process']);
+                $this->terminate_and_reap_process($proc);
 
                 Worker::log(sprintf(
                     '[W%d][TIMEOUT] Batch: %d jobs on site %d exceeded %ds limit (pid %d)',
@@ -829,6 +838,17 @@ class Worker_Process
         }
         // Re-index to prevent gaps
         $this->running_processes = array_values($this->running_processes);
+    }
+
+    /**
+     * Stop an active child process and reap its resources.
+     */
+    private function terminate_and_reap_process(array $proc): void
+    {
+        proc_terminate($proc['process'], 9);
+        fclose($proc['pipes'][1]);
+        fclose($proc['pipes'][2]);
+        proc_close($proc['process']);
     }
 
     /**
@@ -1174,7 +1194,7 @@ class Worker_Process
         }
 
         $table = $wpdb->base_prefix . 'qw_cron_site_locks';
-        $ttl = self::CRON_SITE_LOCK_TTL_SECONDS;
+        $ttl = self::QW_CRON_SITE_LOCK_TTL_SECONDS;
         $result = $wpdb->query($wpdb->prepare(
             "INSERT INTO `$table` (site_id, owner_token, expires_at) "
             . "VALUES (%d, %s, DATE_ADD(NOW(), INTERVAL $ttl SECOND)) "
@@ -1207,7 +1227,7 @@ class Worker_Process
         global $wpdb;
 
         $table = $wpdb->base_prefix . 'qw_cron_site_locks';
-        $ttl = self::CRON_SITE_LOCK_TTL_SECONDS;
+        $ttl = self::QW_CRON_SITE_LOCK_TTL_SECONDS;
         $result = $wpdb->query($wpdb->prepare(
             "UPDATE `$table` SET expires_at = DATE_ADD(NOW(), INTERVAL $ttl SECOND) "
             . 'WHERE site_id = %d AND owner_token = %s',
