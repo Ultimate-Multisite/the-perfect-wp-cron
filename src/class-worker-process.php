@@ -13,6 +13,9 @@ use Workerman\Timer;
  */
 class Worker_Process
 {
+    private const CRON_SITE_LOCK_TTL_SECONDS = 360;
+    private const CRON_SITE_LOCK_REFRESH_SECONDS = 60;
+
     /** @var string Absolute path to wp-load.php */
     private string $wp_load;
 
@@ -49,7 +52,7 @@ class Worker_Process
     /** @var array<string, Job_Payload> tracking_key => payload */
     private array $pending_timer_payloads = [];
 
-    /** @var list<array{process: resource, pipes: array, payloads: list<Job_Payload>, started: int, stdout: string, stderr: string, lane: string}> */
+    /** @var list<array{process: resource, pipes: array, payloads: list<Job_Payload>, started: int, stdout: string, stderr: string, lane: string, cron_site_lock_owner: string, cron_site_lock_refreshed: int}> */
     private array $running_processes = [];
 
     /** @var array<string, array<int, list<Job_Payload>>> lane => site_id => [payload, ...] */
@@ -333,7 +336,12 @@ class Worker_Process
     /**
      * Spawn a subprocess to execute a batch of jobs (all same site).
      */
-    private function spawn_batch(array $payloads, int $worker_id, string $lane = 'wp_cron'): void
+    private function spawn_batch(
+        array $payloads,
+        int $worker_id,
+        string $lane = 'wp_cron',
+        string $cron_site_lock_owner = ''
+    ): bool
     {
         $json_array = array_map(
             fn($p) => array_merge(json_decode($p->to_json(), true), ['lane' => $lane]),
@@ -355,7 +363,10 @@ class Worker_Process
                 count($payloads),
                 $payloads[0]->site_id
             ));
-            return;
+            if ($cron_site_lock_owner !== '') {
+                $this->release_cron_site_lock($payloads[0]->site_id, $cron_site_lock_owner);
+            }
+            return false;
         }
 
         // Write JSON payload to stdin, then close
@@ -366,13 +377,15 @@ class Worker_Process
 
         $this->running_jobs++;
         $this->running_processes[] = [
-            'process'  => $process,
-            'pipes'    => $pipes,
-            'payloads' => $payloads,
-            'started'  => time(),
-            'stdout'   => '',
-            'stderr'   => '',
-            'lane'     => $lane,
+            'process'                  => $process,
+            'pipes'                    => $pipes,
+            'payloads'                 => $payloads,
+            'started'                  => time(),
+            'stdout'                   => '',
+            'stderr'                   => '',
+            'lane'                     => $lane,
+            'cron_site_lock_owner'     => $cron_site_lock_owner,
+            'cron_site_lock_refreshed' => time(),
         ];
 
         $hooks = array_map(fn($p) => $p->hook, $payloads);
@@ -388,6 +401,8 @@ class Worker_Process
             $priority_summary,
             implode(', ', array_unique($hooks))
         ));
+
+        return true;
     }
 
     /**
@@ -407,10 +422,17 @@ class Worker_Process
                 if ($this->running_process_count($lane) >= $this->cron_lane_max_concurrent($lane)) {
                     break;
                 }
+                $site_lock_owner = $this->claim_cron_site_lock((int) $site_id);
+                if ($site_lock_owner === null) {
+                    continue;
+                }
                 $this->sort_payloads_by_priority($this->pending_batch[$lane][$site_id]);
                 $batch = array_splice($this->pending_batch[$lane][$site_id], 0, $this->cron_lane_max_batch_size($lane));
                 // Worker ID isn't critical for batch flush logging; use 0
-                $this->spawn_batch($batch, 0, $lane);
+                if (!$this->spawn_batch($batch, 0, $lane, $site_lock_owner)) {
+                    array_splice($this->pending_batch[$lane][$site_id], 0, 0, $batch);
+                    continue;
+                }
                 if (empty($this->pending_batch[$lane][$site_id])) {
                     unset($this->pending_batch[$lane][$site_id]);
                 }
@@ -479,7 +501,10 @@ class Worker_Process
                 }
                 $this->sort_payloads_by_priority($this->pending_as_batch[$lane][$site_id]);
                 $batch = array_splice($this->pending_as_batch[$lane][$site_id], 0, $this->lane_max_batch_size($lane));
-                $this->spawn_batch($batch, 0, $lane);
+                if (!$this->spawn_batch($batch, 0, $lane)) {
+                    array_splice($this->pending_as_batch[$lane][$site_id], 0, 0, $batch);
+                    continue;
+                }
                 if (empty($this->pending_as_batch[$lane][$site_id])) {
                     unset($this->pending_as_batch[$lane][$site_id]);
                 }
@@ -708,6 +733,14 @@ class Worker_Process
     private function poll_processes(int $worker_id): void
     {
         foreach ($this->running_processes as $i => $proc) {
+            $cron_site_lock_owner = $proc['cron_site_lock_owner'];
+            $lock_refreshed = $proc['cron_site_lock_refreshed'];
+            if ($cron_site_lock_owner !== '' && time() - $lock_refreshed >= self::CRON_SITE_LOCK_REFRESH_SECONDS) {
+                if ($this->refresh_cron_site_lock($proc['payloads'][0]->site_id, $cron_site_lock_owner)) {
+                    $this->running_processes[$i]['cron_site_lock_refreshed'] = time();
+                }
+            }
+
             // Read available output
             $out = stream_get_contents($proc['pipes'][1]);
             if ($out !== false && $out !== '') {
@@ -765,6 +798,7 @@ class Worker_Process
                     ));
                 }
 
+                $this->release_running_cron_site_lock($proc);
                 unset($this->running_processes[$i]);
                 $this->running_jobs--;
                 continue;
@@ -788,6 +822,7 @@ class Worker_Process
                     $pid
                 ));
 
+                $this->release_running_cron_site_lock($proc);
                 unset($this->running_processes[$i]);
                 $this->running_jobs--;
             }
@@ -1121,6 +1156,102 @@ class Worker_Process
     }
 
     /**
+     * Claim the network-wide WP-Cron execution lease for a site.
+     */
+    private function claim_cron_site_lock(int $site_id): ?string
+    {
+        global $wpdb;
+
+        if ($site_id < 1) {
+            return null;
+        }
+
+        try {
+            $owner_token = bin2hex(random_bytes(16));
+        } catch (\Throwable $e) {
+            Worker::log(sprintf('[LOCK][ERROR] Failed to create a cron site-lock token for site %d: %s', $site_id, $e->getMessage()));
+            return null;
+        }
+
+        $table = $wpdb->base_prefix . 'qw_cron_site_locks';
+        $ttl = self::CRON_SITE_LOCK_TTL_SECONDS;
+        $result = $wpdb->query($wpdb->prepare(
+            "INSERT INTO `$table` (site_id, owner_token, expires_at) "
+            . "VALUES (%d, %s, DATE_ADD(NOW(), INTERVAL $ttl SECOND)) "
+            . 'ON DUPLICATE KEY UPDATE '
+            . 'owner_token = IF(expires_at < NOW(), VALUES(owner_token), owner_token), '
+            . 'expires_at = IF(expires_at < NOW(), VALUES(expires_at), expires_at)',
+            $site_id,
+            $owner_token
+        ));
+
+        if ($result === false) {
+            return null;
+        }
+
+        // Do not rely on affected-row semantics: clients using FOUND_ROWS can
+        // report a no-op duplicate-key update as successful.
+        $current_owner = $wpdb->get_var($wpdb->prepare(
+            "SELECT owner_token FROM `$table` WHERE site_id = %d",
+            $site_id
+        ));
+
+        return is_string($current_owner) && hash_equals($owner_token, $current_owner) ? $owner_token : null;
+    }
+
+    /**
+     * Extend a site lease while its subprocess is still running.
+     */
+    private function refresh_cron_site_lock(int $site_id, string $owner_token): bool
+    {
+        global $wpdb;
+
+        $table = $wpdb->base_prefix . 'qw_cron_site_locks';
+        $ttl = self::CRON_SITE_LOCK_TTL_SECONDS;
+        $result = $wpdb->query($wpdb->prepare(
+            "UPDATE `$table` SET expires_at = DATE_ADD(NOW(), INTERVAL $ttl SECOND) "
+            . 'WHERE site_id = %d AND owner_token = %s',
+            $site_id,
+            $owner_token
+        ));
+
+        return $result === 1;
+    }
+
+    /**
+     * Release a site lease only when this worker still owns it.
+     */
+    private function release_cron_site_lock(int $site_id, string $owner_token): void
+    {
+        global $wpdb;
+
+        if ($site_id < 1 || $owner_token === '') {
+            return;
+        }
+
+        $table = $wpdb->base_prefix . 'qw_cron_site_locks';
+        $wpdb->query($wpdb->prepare(
+            "DELETE FROM `$table` WHERE site_id = %d AND owner_token = %s",
+            $site_id,
+            $owner_token
+        ));
+    }
+
+    /**
+     * Release the optional WP-Cron lease attached to a subprocess record.
+     */
+    private function release_running_cron_site_lock(array $process): void
+    {
+        $owner_token = (string) ($process['cron_site_lock_owner'] ?? '');
+        $payloads = $process['payloads'] ?? [];
+        if ($owner_token === '' || empty($payloads)) {
+            return;
+        }
+
+        $this->release_cron_site_lock($payloads[0]->site_id, $owner_token);
+    }
+
+    /**
      * Handle incoming socket commands (status, restart).
      */
     private function handle_command($connection, array $cmd): void
@@ -1421,6 +1552,15 @@ class Worker_Process
         $wpdb->query("CREATE TABLE IF NOT EXISTS `$table` (
             lock_key VARCHAR(64) NOT NULL PRIMARY KEY,
             claimed_at DATETIME NOT NULL
+        ) ENGINE=InnoDB"
+        );
+
+        $cron_site_locks = $wpdb->base_prefix . 'qw_cron_site_locks';
+        $wpdb->query("CREATE TABLE IF NOT EXISTS `$cron_site_locks` (
+            site_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+            owner_token VARCHAR(64) NOT NULL,
+            expires_at DATETIME NOT NULL,
+            KEY expires_at (expires_at)
         ) ENGINE=InnoDB"
         );
     }

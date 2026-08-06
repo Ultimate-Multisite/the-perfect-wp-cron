@@ -108,11 +108,18 @@ class Job_Payload
 
     public function tracking_key(): string
     {
+        if ($this->is_action_scheduler() && $this->action_id > 0) {
+            return sprintf(
+                'action_scheduler:%d:%d',
+                $this->site_id,
+                $this->action_id
+            );
+        }
+
         return sprintf(
-            '%s:%d:%s:%s:%s:%s:%d',
+            '%s:%d:%s:%s:%s:%d',
             $this->source,
             $this->site_id,
-            md5($this->site_url),
             $this->hook,
             $this->group,
             md5(serialize($this->args)),
