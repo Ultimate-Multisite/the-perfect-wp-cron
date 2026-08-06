@@ -8,11 +8,11 @@ WordPress plugin that replaces WP-Cron with an event-loop job queue powered by W
 
 ```bash
 composer install                    # Install PHP dependencies
-npm install                         # Install Node.js dev dependencies
-npm run build                       # Minify CSS and JS assets
-npm run css:build                   # Minify admin.css → admin.min.css
-npm run js:build                    # Minify admin.js → admin.min.js
-npm run archive                     # Build distributable zip (composer install + build + zip)
+pnpm install --frozen-lockfile      # Install Node.js dev dependencies
+pnpm run build                      # Minify CSS and JS assets
+pnpm run css:build                  # Minify admin.css → admin.min.css
+pnpm run js:build                   # Minify admin.js → admin.min.js
+pnpm run archive                    # Build distributable zip (composer install + build + zip)
 ```
 
 ## Project Structure
