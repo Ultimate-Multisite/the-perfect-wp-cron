@@ -115,4 +115,19 @@ class Socket_Client
     {
         return file_exists(self::get_socket_path());
     }
+
+    /**
+     * Let Ultimate Multisite distinguish an intentional DISABLE_WP_CRON from
+     * a site that has no working external cron runner.
+     */
+    public static function filter_wp_cron_status_override($status)
+    {
+        if ($status !== null || !self::is_worker_running()) {
+            return $status;
+        }
+
+        $worker_status = self::send_command('status', 1);
+
+        return is_array($worker_status) && !empty($worker_status['ready']) ? true : null;
+    }
 }

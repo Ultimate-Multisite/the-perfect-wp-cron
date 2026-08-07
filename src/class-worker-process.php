@@ -858,12 +858,19 @@ class Worker_Process
     {
         $sites = get_sites(['number' => 0, 'fields' => 'ids']);
         $sovereign_sites = $this->sovereign_site_entries();
+        $isolated_networks = $this->isolated_network_entries();
 
         $current_blog_id = get_current_blog_id();
 
         foreach ($sites as $site_id) {
             $site_id = (int) $site_id;
             if (isset($sovereign_sites[$site_id])) {
+                continue;
+            }
+
+            $site = get_site($site_id);
+            $network_id = $site ? (int) $site->site_id : 0;
+            if (isset($isolated_networks[$network_id])) {
                 continue;
             }
 
@@ -914,6 +921,10 @@ class Worker_Process
 
         foreach ($sovereign_sites as $site_id => $entry) {
             $this->rescan_sovereign_site_jobs((int) $site_id, $entry);
+        }
+
+        foreach ($isolated_networks as $network_id => $entry) {
+            $this->rescan_isolated_network_jobs((int) $network_id, $entry);
         }
 
         if ($current_blog_id !== get_current_blog_id()) {
@@ -993,16 +1004,80 @@ class Worker_Process
         return $entries;
     }
 
+    /**
+     * Load routable isolated networks from the generated network registry.
+     *
+     * The registry is read on every full rescan so newly provisioned tenant
+     * databases are picked up without restarting the worker.
+     *
+     * @return array<int, array>
+     */
+    private function isolated_network_entries(): array
+    {
+        if (!defined('WP_CONTENT_DIR')) {
+            return [];
+        }
+
+        $path = WP_CONTENT_DIR . '/network-registry.data.json';
+        if (!is_readable($path)) {
+            return [];
+        }
+
+        $json = file_get_contents($path);
+        $data = json_decode($json ?: '', true);
+        if (!is_array($data) || empty($data['networks']) || !is_array($data['networks'])) {
+            return [];
+        }
+
+        $entries = [];
+        foreach ($data['networks'] as $registry_id => $entry) {
+            if (!is_array($entry) || ($entry['tier'] ?? '') !== 'isolated') {
+                continue;
+            }
+            if (($entry['status'] ?? 'active') !== 'active') {
+                continue;
+            }
+
+            $network_id = (int) ($entry['network_id'] ?? $entry['id'] ?? $registry_id);
+            if ($network_id < 1 || $this->site_url_from_registry_entry($entry) === '') {
+                continue;
+            }
+
+            $entries[$network_id] = $entry;
+        }
+
+        return $entries;
+    }
+
     private function rescan_sovereign_site_jobs(int $site_id, array $entry): void
     {
+        $this->rescan_registry_jobs('SOVEREIGN', 'site', $site_id, $entry, [
+            'site_id' => $site_id,
+        ]);
+    }
+
+    private function rescan_isolated_network_jobs(int $network_id, array $entry): void
+    {
+        $this->rescan_registry_jobs('ISOLATED', 'network', $network_id, $entry, [
+            'isolated_network_id' => $network_id,
+        ]);
+    }
+
+    private function rescan_registry_jobs(
+        string $registry_kind,
+        string $subject,
+        int $registry_id,
+        array $entry,
+        array $routing
+    ): void {
         if ($this->scan_script === '' || !file_exists($this->scan_script)) {
-            Worker::log(sprintf('[RESCAN][SOVEREIGN][ERROR] Missing scan script for site %d', $site_id));
+            Worker::log(sprintf('[RESCAN][%s][ERROR] Missing scan script for %s %d', $registry_kind, $subject, $registry_id));
             return;
         }
 
         $site_url = $this->site_url_from_registry_entry($entry);
         if ($site_url === '') {
-            Worker::log(sprintf('[RESCAN][SOVEREIGN][ERROR] Missing tenant domain for site %d', $site_id));
+            Worker::log(sprintf('[RESCAN][%s][ERROR] Missing tenant domain for %s %d', $registry_kind, $subject, $registry_id));
             return;
         }
 
@@ -1014,14 +1089,13 @@ class Worker_Process
         ], $pipes);
 
         if (!is_resource($process)) {
-            Worker::log(sprintf('[RESCAN][SOVEREIGN][ERROR] Failed to spawn scan for site %d', $site_id));
+            Worker::log(sprintf('[RESCAN][%s][ERROR] Failed to spawn scan for %s %d', $registry_kind, $subject, $registry_id));
             return;
         }
 
-        fwrite($pipes[0], json_encode([
-            'site_id'  => $site_id,
+        fwrite($pipes[0], json_encode(array_merge($routing, [
             'site_url' => $site_url,
-        ]));
+        ])));
         fclose($pipes[0]);
 
         $stdout = stream_get_contents($pipes[1]);
@@ -1032,8 +1106,10 @@ class Worker_Process
 
         if ($exit_code !== 0) {
             Worker::log(sprintf(
-                '[RESCAN][SOVEREIGN][FAIL] Site %d scan exited with code %d (%s)',
-                $site_id,
+                '[RESCAN][%s][FAIL] %s %d scan exited with code %d (%s)',
+                $registry_kind,
+                ucfirst($subject),
+                $registry_id,
                 $exit_code,
                 $this->sovereign_scan_diagnostic('stderr', (string) $stderr)
             ));
@@ -1042,8 +1118,10 @@ class Worker_Process
 
         if ($stdout === '') {
             Worker::log(sprintf(
-                '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned empty output (%s)',
-                $site_id,
+                '[RESCAN][%s][FAIL] %s %d scan returned empty output (%s)',
+                $registry_kind,
+                ucfirst($subject),
+                $registry_id,
                 $this->sovereign_scan_diagnostic('stderr', (string) $stderr)
             ));
             return;
@@ -1053,8 +1131,10 @@ class Worker_Process
             $payloads = json_decode($stdout, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             Worker::log(sprintf(
-                '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned invalid JSON (%s; %s; %s)',
-                $site_id,
+                '[RESCAN][%s][FAIL] %s %d scan returned invalid JSON (%s; %s; %s)',
+                $registry_kind,
+                ucfirst($subject),
+                $registry_id,
                 $e->getMessage(),
                 $this->sovereign_scan_diagnostic('stdout', $stdout),
                 $this->sovereign_scan_diagnostic('stderr', (string) $stderr)
@@ -1064,26 +1144,54 @@ class Worker_Process
 
         if (!array_is_list($payloads)) {
             Worker::log(sprintf(
-                '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned an invalid payload shape (%s)',
-                $site_id,
+                '[RESCAN][%s][FAIL] %s %d scan returned an invalid payload shape (%s)',
+                $registry_kind,
+                ucfirst($subject),
+                $registry_id,
                 $this->sovereign_scan_diagnostic('stdout', $stdout)
             ));
             return;
         }
 
+        $validated_payloads = [];
         foreach ($payloads as $payload_data) {
             if (!is_array($payload_data)) {
                 Worker::log(sprintf(
-                    '[RESCAN][SOVEREIGN][FAIL] Site %d scan returned an invalid payload shape (%s)',
-                    $site_id,
+                    '[RESCAN][%s][FAIL] %s %d scan returned an invalid payload shape (%s)',
+                    $registry_kind,
+                    ucfirst($subject),
+                    $registry_id,
                     $this->sovereign_scan_diagnostic('stdout', $stdout)
                 ));
                 return;
             }
+
+            try {
+                $payload = new Job_Payload($payload_data);
+            } catch (\Throwable $e) {
+                Worker::log(sprintf(
+                    '[RESCAN][%s][FAIL] %s %d scan returned invalid routing metadata (%s)',
+                    $registry_kind,
+                    ucfirst($subject),
+                    $registry_id,
+                    $e->getMessage()
+                ));
+                return;
+            }
+
+            if ($registry_kind === 'ISOLATED' && !$payload->routes_to_isolated_network($registry_id)) {
+                Worker::log(sprintf(
+                    '[RESCAN][ISOLATED][FAIL] Network %d scan did not route to the expected isolated network',
+                    $registry_id
+                ));
+                return;
+            }
+
+            $validated_payloads[] = $payload;
         }
 
-        foreach ($payloads as $payload_data) {
-            $this->schedule_timer(new Job_Payload($payload_data));
+        foreach ($validated_payloads as $payload) {
+            $this->schedule_timer($payload);
         }
     }
 
@@ -1100,7 +1208,15 @@ class Worker_Process
 
     private function site_url_from_registry_entry(array $entry): string
     {
-        foreach ($entry['domains'] ?? [] as $domain) {
+        $domains = $entry['domains'] ?? [];
+        if (!is_array($domains)) {
+            $domains = [];
+        }
+        if (!empty($entry['domain'])) {
+            array_unshift($domains, $entry['domain']);
+        }
+
+        foreach ($domains as $domain) {
             $domain = trim((string) $domain);
             if ($domain !== '') {
                 return 'https://' . $domain . '/';

@@ -106,12 +106,15 @@ namespace {
     use QueueWorker\Cron_Interceptor;
     use QueueWorker\Job_Log;
     use QueueWorker\Job_Payload;
+    use QueueWorker\Socket_Client;
     use QueueWorker\Worker_Process;
 
     $_SERVER['HTTP_HOST'] = 'example.test';
 
     $GLOBALS['test_crons'] = [];
     $GLOBALS['test_current_blog_id'] = 1;
+    $GLOBALS['test_sites'] = [1];
+    $GLOBALS['test_site_network_ids'] = [];
     $GLOBALS['test_filters'] = [];
     $GLOBALS['test_actions'] = [];
     $GLOBALS['test_switched_blogs'] = [];
@@ -159,6 +162,10 @@ namespace {
         strpos($plugin_entrypoint, "add_action('init', ['QueueWorker\\\\Cron_Interceptor', 'register'])")
             < strpos($plugin_entrypoint, 'if ($job_executor_running)'),
         'Executor subprocesses must register scheduling interceptors before stopping normal plugin bootstrap'
+    );
+    assert_true(
+        str_contains($plugin_entrypoint, "add_filter('wu_wp_cron_status_override', ['QueueWorker\\\\Socket_Client', 'filter_wp_cron_status_override'])"),
+        'Plugin bootstrap must register the Ultimate Multisite cron health override'
     );
 
     class Test_WPDB
@@ -246,11 +253,10 @@ namespace {
 
     function get_site(int $site_id): object
     {
-        unset($site_id);
-
         return (object) [
-            'domain' => $GLOBALS['test_site_domain'],
-            'path'   => $GLOBALS['test_site_path'],
+            'domain'  => $GLOBALS['test_site_domain'],
+            'path'    => $GLOBALS['test_site_path'],
+            'site_id' => $GLOBALS['test_site_network_ids'][$site_id] ?? 1,
         ];
     }
 
@@ -276,7 +282,9 @@ namespace {
 
     function get_sites(array $args): array
     {
-        return [1];
+        unset($args);
+
+        return $GLOBALS['test_sites'];
     }
 
     function switch_to_blog(int $site_id): void
@@ -429,6 +437,7 @@ namespace {
     require_once __DIR__ . '/../src/class-job-log.php';
     require_once __DIR__ . '/../src/class-job-payload.php';
     require_once __DIR__ . '/../src/class-job-executor.php';
+    require_once __DIR__ . '/../src/class-socket-client.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
 
     $payload = new Job_Payload([
@@ -687,6 +696,135 @@ namespace {
             'example.test' => 7,
         ],
     ])), 'Registry fixture must be writable');
+
+    $isolated_site_1 = Job_Payload::isolated_site_id(49, 1);
+    $isolated_site_2 = Job_Payload::isolated_site_id(49, 2);
+    $other_network_site_1 = Job_Payload::isolated_site_id(50, 1);
+    assert_same(210453397505, $isolated_site_1, 'Isolated queue identity must combine the network and local blog IDs deterministically');
+    assert_true($isolated_site_1 !== $isolated_site_2, 'Local blog IDs must not collide inside one isolated network');
+    assert_true($isolated_site_1 !== $other_network_site_1, 'Identical local blog IDs must not collide across isolated networks');
+    assert_true($isolated_site_1 !== 1, 'Isolated queue identities must not collide with ordinary root blog IDs');
+
+    $isolated_payload = new Job_Payload([
+        'site_id'             => $isolated_site_1,
+        'isolated_network_id' => 49,
+        'local_site_id'       => 1,
+        'site_url'            => 'https://isolated.example.test',
+        'hook'                => 'isolated_hook',
+        'timestamp'           => 2147483647,
+    ]);
+    assert_true($isolated_payload->routes_to_isolated_network(49), 'Isolated payload metadata must validate against its composite queue identity');
+    assert_same(49, json_decode($isolated_payload->to_json(), true)['isolated_network_id'] ?? null, 'Isolated routing metadata must survive queue serialization');
+    try {
+        new Job_Payload([
+            'site_id'             => $isolated_site_1,
+            'isolated_network_id' => 50,
+            'local_site_id'       => 1,
+        ]);
+        throw new RuntimeException('Mismatched isolated payload metadata must fail closed');
+    } catch (InvalidArgumentException $exception) {
+        assert_true(str_contains($exception->getMessage(), 'does not match'), 'Mismatched isolated payload metadata must report its identity failure');
+    }
+
+    assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/network-registry.data.json', json_encode([
+        'networks' => [
+            49 => ['tier' => 'isolated', 'status' => 'active', 'domain' => 'isolated.example.test'],
+            50 => ['tier' => 'shared', 'status' => 'active', 'domain' => 'shared.example.test'],
+            51 => ['tier' => 'isolated', 'status' => 'inactive', 'domain' => 'inactive.example.test'],
+            52 => ['tier' => 'isolated', 'status' => 'active'],
+        ],
+    ])), 'Network registry fixture must be writable');
+    $registry_worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
+    assert_same([49], array_keys(invoke_private($registry_worker, 'isolated_network_entries')), 'Only active, routable isolated network entries may be scanned');
+    assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/network-registry.data.json', json_encode([
+        'networks' => [
+            49 => ['tier' => 'isolated', 'status' => 'active', 'domain' => 'isolated.example.test'],
+            53 => ['tier' => 'isolated', 'status' => 'active', 'domains' => ['new-isolated.example.test']],
+        ],
+    ])), 'Updated network registry fixture must be writable');
+    assert_same([49, 53], array_keys(invoke_private($registry_worker, 'isolated_network_entries')), 'Every full-rescan lookup must re-read newly registered isolated networks');
+    assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/network-registry.data.json', json_encode([
+        'networks' => [
+            12 => ['tier' => 'isolated', 'status' => 'active', 'domain' => 'isolated.example.test'],
+        ],
+    ])), 'Final network registry fixture must be writable');
+
+    $isolated_scan_fixture = tempnam(sys_get_temp_dir(), 'qw-isolated-scan-');
+    assert_true(false !== $isolated_scan_fixture, 'Isolated scan fixture must be created');
+    $mismatched_scan_output = json_encode([[
+        'site_id'             => Job_Payload::isolated_site_id(50, 1),
+        'isolated_network_id' => 50,
+        'local_site_id'       => 1,
+        'site_url'            => 'https://wrong-isolated.example.test',
+        'hook'                => 'wrong_isolated_hook',
+        'timestamp'           => 2147483647,
+    ]]);
+    assert_true(false !== file_put_contents(
+        $isolated_scan_fixture,
+        '<?php fwrite(STDOUT, ' . var_export($mismatched_scan_output, true) . ');'
+    ), 'Mismatched isolated scan fixture must be writable');
+    $isolated_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $isolated_scan_fixture);
+    \Workerman\Worker::$logs = [];
+    \Workerman\Timer::$delays = [];
+    invoke_private($isolated_worker, 'rescan_isolated_network_jobs', [49, ['domain' => 'isolated.example.test']]);
+    assert_same([], \Workerman\Timer::$delays, 'Scanner payloads routed to another isolated network must not be scheduled');
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'did not route to the expected isolated network'),
+        'Rejected isolated scanner payloads must identify the route mismatch'
+    );
+
+    $valid_scan_output = json_encode([json_decode($isolated_payload->to_json(), true)]);
+    assert_true(false !== file_put_contents(
+        $isolated_scan_fixture,
+        '<?php fwrite(STDOUT, ' . var_export($valid_scan_output, true) . ');'
+    ), 'Valid isolated scan fixture must be writable');
+    \Workerman\Worker::$logs = [];
+    \Workerman\Timer::$delays = [];
+    invoke_private($isolated_worker, 'rescan_isolated_network_jobs', [49, ['domain' => 'isolated.example.test']]);
+    assert_same(1, count(\Workerman\Timer::$delays), 'Valid isolated scanner payloads must be scheduled');
+
+    $proxy_network_payload = new Job_Payload([
+        'site_id'             => Job_Payload::isolated_site_id(12, 1),
+        'isolated_network_id' => 12,
+        'local_site_id'       => 1,
+        'site_url'            => 'https://isolated.example.test',
+        'hook'                => 'proxy_network_hook',
+        'timestamp'           => 2147483647,
+    ]);
+    $proxy_scan_output = json_encode([json_decode($proxy_network_payload->to_json(), true)]);
+    assert_true(false !== file_put_contents(
+        $isolated_scan_fixture,
+        '<?php fwrite(STDOUT, ' . var_export($proxy_scan_output, true) . ');'
+    ), 'Proxy-network scan fixture must be writable');
+    $GLOBALS['test_sites'] = [1, 175];
+    $GLOBALS['test_site_network_ids'] = [
+        1   => 1,
+        175 => 12,
+    ];
+    $GLOBALS['test_switched_blogs'] = [];
+    $GLOBALS['test_crons'] = [];
+    \Workerman\Timer::$delays = [];
+    $root_scan_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $isolated_scan_fixture);
+    invoke_private($root_scan_worker, 'rescan_all_jobs');
+    assert_true(!in_array(175, $GLOBALS['test_switched_blogs'], true), 'Root scanning must skip proxy blog 175 because it belongs to isolated network 12');
+    assert_same(1, count(\Workerman\Timer::$delays), 'A root full rescan must include the isolated tenant scanner result');
+    $GLOBALS['test_sites'] = [1];
+    $GLOBALS['test_site_network_ids'] = [];
+    assert_true(unlink($isolated_scan_fixture), 'Isolated scan fixture must be removed');
+    \Workerman\Timer::$delays = [];
+
+    assert_true(
+        str_contains($scan_script, "defined('WU_MT_LEGACY_ISOLATED_NETWORK')")
+            && str_contains($scan_script, "get_sites(['number' => 0, 'fields' => 'ids'])")
+            && str_contains($scan_script, 'qw_scan_current_site_jobs()'),
+        'Isolated scanner bootstrap must validate the routed network and enumerate every tenant-local site'
+    );
+    assert_true(
+        str_contains($executor_entrypoint, 'routes_to_isolated_network($isolated_network_id)')
+            && str_contains($executor_entrypoint, "defined('WU_MT_LEGACY_ISOLATED_NETWORK')"),
+        'Executor bootstrap must validate isolated queue identities and the routed tenant network'
+    );
+
     $GLOBALS['test_current_blog_id'] = 49;
     $GLOBALS['test_ms_switched'] = true;
     $GLOBALS['test_site_url'] = 'https://mapped.example.test/wp';
@@ -1103,6 +1241,46 @@ namespace {
         assert_true(str_contains($cleanup_query, 'ORDER BY completed_at ASC'), 'Job log cleanup must delete the oldest rows first');
         assert_true(str_contains($cleanup_query, 'LIMIT 10000'), 'Job log cleanup must bound each delete statement');
     }
+
+    assert_same(false, Socket_Client::filter_wp_cron_status_override(false), 'Cron health override must preserve a prior non-null decision');
+    putenv('QUEUE_WORKER_SOCKET_PATH=' . sys_get_temp_dir() . '/qw-missing-socket-' . getmypid());
+    assert_same(null, Socket_Client::filter_wp_cron_status_override(null), 'Cron health override must retain the null sentinel when no worker is available');
+    if (function_exists('pcntl_fork')) {
+        $status_socket = sys_get_temp_dir() . '/qw-status-' . getmypid() . '.sock';
+        @unlink($status_socket);
+        $status_server = stream_socket_server('unix://' . $status_socket, $status_errno, $status_error);
+        assert_true(is_resource($status_server), 'Cron health status fixture must create a Unix socket: ' . $status_error);
+        $status_pid = pcntl_fork();
+        assert_true($status_pid >= 0, 'Cron health status fixture must fork');
+        if ($status_pid === 0) {
+            $status_connection = stream_socket_accept($status_server, 2);
+            if (is_resource($status_connection)) {
+                fgets($status_connection);
+                fwrite($status_connection, json_encode(['ready' => true]) . "\n");
+                fclose($status_connection);
+            }
+            fclose($status_server);
+            exit(0);
+        }
+        fclose($status_server);
+        putenv('QUEUE_WORKER_SOCKET_PATH=' . $status_socket);
+        assert_same(true, Socket_Client::filter_wp_cron_status_override(null), 'A ready Socket_Client worker must report intentional external cron as healthy');
+        pcntl_waitpid($status_pid, $status_result);
+        assert_true(unlink($status_socket), 'Cron health status fixture socket must be removed');
+    }
+    putenv('QUEUE_WORKER_SOCKET_PATH');
+
+    define('WU_MT_LEGACY_ISOLATED_NETWORK', 49);
+    $GLOBALS['test_current_blog_id'] = 2;
+    $live_isolated_payload = Job_Payload::from_cron_event((object) [
+        'hook'      => 'live_isolated_hook',
+        'args'      => [],
+        'timestamp' => 2147483647,
+        'schedule'  => '',
+    ]);
+    assert_same(Job_Payload::isolated_site_id(49, 2), $live_isolated_payload->site_id, 'Live request interception must use the collision-safe isolated queue identity');
+    assert_same(49, $live_isolated_payload->isolated_network_id, 'Live request payloads must carry their isolated network route');
+    assert_same(2, $live_isolated_payload->local_site_id, 'Live request payloads must carry their tenant-local blog route');
 
     echo "Regression tests passed.\n";
 }

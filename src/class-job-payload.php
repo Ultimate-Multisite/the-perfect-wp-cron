@@ -4,7 +4,11 @@ namespace QueueWorker;
 
 class Job_Payload
 {
+    private const ISOLATED_SITE_FACTOR = 4294967296;
+
     public int $site_id;
+    public int $isolated_network_id;
+    public int $local_site_id;
     public string $site_url;
     public string $hook;
     public array $args;
@@ -18,7 +22,9 @@ class Job_Payload
 
     public function __construct(array $data = [])
     {
-        $this->site_id   = $data['site_id'] ?? self::current_site_id();
+        $this->isolated_network_id = (int) ($data['isolated_network_id'] ?? self::current_isolated_network_id());
+        $this->local_site_id = (int) ($data['local_site_id'] ?? ($this->isolated_network_id > 0 ? get_current_blog_id() : 0));
+        $this->site_id   = (int) ($data['site_id'] ?? self::current_site_id());
         $this->site_url  = $data['site_url'] ?? self::current_site_url();
         $this->hook      = $data['hook'] ?? '';
         $this->args      = $data['args'] ?? [];
@@ -29,22 +35,34 @@ class Job_Payload
         $this->action_id = $data['action_id'] ?? 0;
         $this->group     = $data['group'] ?? '';
         $this->lane      = $data['lane'] ?? ($this->source === 'action_scheduler' ? 'action_scheduler' : 'wp_cron');
+
+        if (($this->isolated_network_id > 0) !== ($this->local_site_id > 0)) {
+            throw new \InvalidArgumentException('Incomplete isolated network routing metadata');
+        }
+
+        if ($this->isolated_network_id > 0
+            && $this->site_id !== self::isolated_site_id($this->isolated_network_id, $this->local_site_id)
+        ) {
+            throw new \InvalidArgumentException('Isolated queue site identity does not match its routing metadata');
+        }
     }
 
     public function to_json(): string
     {
         return json_encode([
-            'site_id'   => $this->site_id,
-            'site_url'  => $this->site_url,
-            'hook'      => $this->hook,
-            'args'      => $this->args,
-            'timestamp' => $this->timestamp,
-            'schedule'  => $this->schedule,
-            'interval'  => $this->interval,
-            'source'    => $this->source,
-            'action_id' => $this->action_id,
-            'group'     => $this->group,
-            'lane'      => $this->lane,
+            'site_id'             => $this->site_id,
+            'isolated_network_id' => $this->isolated_network_id,
+            'local_site_id'       => $this->local_site_id,
+            'site_url'            => $this->site_url,
+            'hook'                => $this->hook,
+            'args'                => $this->args,
+            'timestamp'           => $this->timestamp,
+            'schedule'            => $this->schedule,
+            'interval'            => $this->interval,
+            'source'              => $this->source,
+            'action_id'           => $this->action_id,
+            'group'               => $this->group,
+            'lane'                => $this->lane,
         ]);
     }
 
@@ -151,10 +169,35 @@ class Job_Payload
         return $this->is_recurring() ? 'wp_cron:recurring' : 'wp_cron:one-shot';
     }
 
+    public static function isolated_site_id(int $network_id, int $local_site_id): int
+    {
+        if (PHP_INT_SIZE < 8 || $network_id < 1 || $network_id > 2147483647
+            || $local_site_id < 1 || $local_site_id > 4294967295
+        ) {
+            throw new \InvalidArgumentException('Isolated network and local site IDs exceed the queue identity range');
+        }
+
+        return ($network_id * self::ISOLATED_SITE_FACTOR) + $local_site_id;
+    }
+
+    public function routes_to_isolated_network(int $network_id): bool
+    {
+        if ($network_id < 1 || $this->isolated_network_id !== $network_id || $this->local_site_id < 1) {
+            return false;
+        }
+
+        return $this->site_id === self::isolated_site_id($network_id, $this->local_site_id);
+    }
+
     private static function current_site_id(): int
     {
         if (defined('WU_MT_SOVEREIGN_TENANT')) {
             return (int) WU_MT_SOVEREIGN_TENANT;
+        }
+
+        $isolated_network_id = self::current_isolated_network_id();
+        if ($isolated_network_id > 0) {
+            return self::isolated_site_id($isolated_network_id, get_current_blog_id());
         }
 
         if (function_exists('ms_is_switched') && ms_is_switched()) {
@@ -173,6 +216,15 @@ class Job_Payload
         }
 
         return get_current_blog_id();
+    }
+
+    private static function current_isolated_network_id(): int
+    {
+        if (defined('WU_MT_SOVEREIGN_TENANT') || !defined('WU_MT_LEGACY_ISOLATED_NETWORK')) {
+            return 0;
+        }
+
+        return (int) WU_MT_LEGACY_ISOLATED_NETWORK;
     }
 
     /**

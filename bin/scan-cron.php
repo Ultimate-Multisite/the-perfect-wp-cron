@@ -81,60 +81,48 @@ define('QUEUE_WORKER_RUNNING', true);
 
 require_once $wp_load;
 
-$site_id = (int) ($payload['site_id'] ?? get_current_blog_id());
-$is_sovereign_tenant = (defined('WU_MT_SOVEREIGN_TENANT') && (int) WU_MT_SOVEREIGN_TENANT === $site_id)
-    || qw_scan_payload_matches_sovereign_registry($site_id, $domain);
-if (!$is_sovereign_tenant && $site_id !== get_current_blog_id()) {
-    switch_to_blog($site_id);
-}
-
-wp_cache_delete('cron', 'options');
-wp_cache_delete('alloptions', 'options');
-
 $payloads = [];
-$crons = _get_cron_array();
-if (is_array($crons)) {
-    $seen_cron_signatures = [];
-    foreach ($crons as $timestamp => $hooks) {
-        if (!is_array($hooks)) {
-            continue;
-        }
-        foreach ($hooks as $hook => $events) {
-            if (Cron_Event_Filter::should_bypass($hook)) {
-                continue;
-            }
-            foreach ($events as $event) {
-                $signature = qw_scan_cron_event_signature($hook, $event, (int) $timestamp);
-                if (isset($seen_cron_signatures[$signature])) {
-                    continue;
-                }
-                $seen_cron_signatures[$signature] = true;
+$isolated_network_id = (int) ($payload['isolated_network_id'] ?? 0);
+if ($isolated_network_id > 0) {
+    if (!defined('WU_MT_LEGACY_ISOLATED_NETWORK')
+        || (int) WU_MT_LEGACY_ISOLATED_NETWORK !== $isolated_network_id
+    ) {
+        fwrite(STDERR, sprintf(
+            "Isolated network mismatch: domain routed to network %d, expected network %d.\n",
+            defined('WU_MT_LEGACY_ISOLATED_NETWORK') ? (int) WU_MT_LEGACY_ISOLATED_NETWORK : 0,
+            $isolated_network_id
+        ));
+        exit(1);
+    }
 
-                $event_obj = (object) array_merge($event, [
-                    'hook'      => $hook,
-                    'timestamp' => $timestamp,
-                ]);
-                $payloads[] = json_decode(Job_Payload::from_cron_event($event_obj)->to_json(), true);
-            }
+    $initial_blog_id = get_current_blog_id();
+    $site_ids = is_multisite() ? get_sites(['number' => 0, 'fields' => 'ids']) : [$initial_blog_id];
+    foreach ($site_ids as $local_site_id) {
+        $local_site_id = (int) $local_site_id;
+        $switched = $local_site_id !== get_current_blog_id();
+        if ($switched) {
+            switch_to_blog($local_site_id);
+        }
+
+        $payloads = array_merge($payloads, qw_scan_current_site_jobs());
+
+        if ($switched) {
+            restore_current_blog();
         }
     }
-}
 
-if (function_exists('as_get_scheduled_actions') && qw_scan_action_scheduler_tables_exist()) {
-    try {
-        $actions = as_get_scheduled_actions([
-            'status'   => \ActionScheduler_Store::STATUS_PENDING,
-            'per_page' => 500,
-        ]);
-        foreach ($actions as $action_id => $action) {
-            $action_payload = Job_Payload::from_as_action($action_id);
-            if ($action_payload) {
-                $payloads[] = json_decode($action_payload->to_json(), true);
-            }
-        }
-    } catch (\Throwable $e) {
-        fwrite(STDERR, "Action Scheduler scan failed: " . $e->getMessage() . "\n");
+    if ($initial_blog_id !== get_current_blog_id()) {
+        switch_to_blog($initial_blog_id);
     }
+} else {
+    $site_id = (int) ($payload['site_id'] ?? get_current_blog_id());
+    $is_sovereign_tenant = (defined('WU_MT_SOVEREIGN_TENANT') && (int) WU_MT_SOVEREIGN_TENANT === $site_id)
+        || qw_scan_payload_matches_sovereign_registry($site_id, $domain);
+    if (!$is_sovereign_tenant && $site_id !== get_current_blog_id()) {
+        switch_to_blog($site_id);
+    }
+
+    $payloads = qw_scan_current_site_jobs();
 }
 
 // A plugin can leave nested output buffers open. Discard every buffer opened
@@ -160,6 +148,60 @@ try {
 }
 
 fwrite(STDOUT, $encoded_payloads);
+
+function qw_scan_current_site_jobs(): array
+{
+    wp_cache_delete('cron', 'options');
+    wp_cache_delete('alloptions', 'options');
+
+    $payloads = [];
+    $crons = _get_cron_array();
+    if (is_array($crons)) {
+        $seen_cron_signatures = [];
+        foreach ($crons as $timestamp => $hooks) {
+            if (!is_array($hooks)) {
+                continue;
+            }
+            foreach ($hooks as $hook => $events) {
+                if (Cron_Event_Filter::should_bypass($hook)) {
+                    continue;
+                }
+                foreach ($events as $event) {
+                    $signature = qw_scan_cron_event_signature($hook, $event, (int) $timestamp);
+                    if (isset($seen_cron_signatures[$signature])) {
+                        continue;
+                    }
+                    $seen_cron_signatures[$signature] = true;
+
+                    $event_obj = (object) array_merge($event, [
+                        'hook'      => $hook,
+                        'timestamp' => $timestamp,
+                    ]);
+                    $payloads[] = json_decode(Job_Payload::from_cron_event($event_obj)->to_json(), true);
+                }
+            }
+        }
+    }
+
+    if (function_exists('as_get_scheduled_actions') && qw_scan_action_scheduler_tables_exist()) {
+        try {
+            $actions = as_get_scheduled_actions([
+                'status'   => \ActionScheduler_Store::STATUS_PENDING,
+                'per_page' => 500,
+            ]);
+            foreach ($actions as $action_id => $action) {
+                $action_payload = Job_Payload::from_as_action($action_id);
+                if ($action_payload) {
+                    $payloads[] = json_decode($action_payload->to_json(), true);
+                }
+            }
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "Action Scheduler scan failed: " . $e->getMessage() . "\n");
+        }
+    }
+
+    return $payloads;
+}
 
 function qw_scan_action_scheduler_tables_exist(): bool
 {
