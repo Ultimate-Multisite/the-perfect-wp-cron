@@ -152,6 +152,20 @@ namespace {
         'Executor subprocesses must identify themselves before WordPress loads'
     );
 
+    $scanner_entrypoint = file_get_contents(__DIR__ . '/../bin/scan-cron.php');
+    assert_true(is_string($scanner_entrypoint), 'Scanner entrypoint must be readable');
+    $scanner_discovery = strpos($scanner_entrypoint, 'QueueWorker\\Bootstrap::discover_wp_load');
+    $scanner_abspath = strpos($scanner_entrypoint, "define('ABSPATH'");
+    $scanner_site_autoload = strpos($scanner_entrypoint, 'require_once $site_autoload;');
+    assert_true(
+        $scanner_discovery !== false
+            && $scanner_abspath !== false
+            && $scanner_site_autoload !== false
+            && $scanner_discovery < $scanner_site_autoload
+            && $scanner_abspath < $scanner_site_autoload,
+        'Scanner must discover WordPress and define ABSPATH before loading the site autoloader'
+    );
+
     $plugin_entrypoint = file_get_contents(__DIR__ . '/../the-perfect-wp-cron.php');
     assert_true(is_string($plugin_entrypoint), 'Plugin entrypoint must be readable');
     assert_true(
