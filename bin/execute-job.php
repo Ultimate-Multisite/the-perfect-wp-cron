@@ -76,6 +76,7 @@ if (!class_exists('QueueWorker\\Config')) {
 use QueueWorker\Bootstrap;
 use QueueWorker\Job_Executor;
 use QueueWorker\Job_Log;
+use QueueWorker\Job_Payload;
 
 // --- Load environment ---
 $site_root = $site_autoload ? dirname($site_autoload, 2) : dirname(__DIR__);
@@ -106,15 +107,55 @@ require_once $wp_load;
 // WordPress loads is unsafe because site-active plugins and database routing
 // have already been selected for the wrong site.
 $site_id = (int) ($payload['site_id'] ?? get_current_blog_id());
-$is_sovereign_tenant = (defined('WU_MT_SOVEREIGN_TENANT') && (int) WU_MT_SOVEREIGN_TENANT === $site_id)
-    || qw_payload_matches_sovereign_registry($site_id, $domain);
-if (!$is_sovereign_tenant && $site_id !== get_current_blog_id()) {
-    fwrite(STDERR, sprintf(
-        "Payload site mismatch: URL resolved to blog %d, expected blog %d.\n",
-        get_current_blog_id(),
-        $site_id
-    ));
-    exit(1);
+$isolated_network_id = (int) ($payload['isolated_network_id'] ?? 0);
+$local_site_id = (int) ($payload['local_site_id'] ?? 0);
+
+foreach ($payloads as $batch_payload) {
+    if (!is_array($batch_payload) || (int) ($batch_payload['site_id'] ?? 0) !== $site_id) {
+        fwrite(STDERR, "Batch contains mismatched queue site identities.\n");
+        exit(1);
+    }
+}
+
+if ($isolated_network_id > 0 || $local_site_id > 0) {
+    try {
+        foreach ($payloads as $batch_payload) {
+            $job_payload = new Job_Payload($batch_payload);
+            if (!$job_payload->routes_to_isolated_network($isolated_network_id)
+                || $job_payload->local_site_id !== $local_site_id
+            ) {
+                throw new \RuntimeException('batch routing metadata mismatch');
+            }
+        }
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Invalid isolated network payload: " . $e->getMessage() . "\n");
+        exit(1);
+    }
+
+    if (!defined('WU_MT_LEGACY_ISOLATED_NETWORK')
+        || (int) WU_MT_LEGACY_ISOLATED_NETWORK !== $isolated_network_id
+        || get_current_blog_id() !== $local_site_id
+    ) {
+        fwrite(STDERR, sprintf(
+            "Isolated payload route mismatch: resolved network %d blog %d, expected network %d blog %d.\n",
+            defined('WU_MT_LEGACY_ISOLATED_NETWORK') ? (int) WU_MT_LEGACY_ISOLATED_NETWORK : 0,
+            get_current_blog_id(),
+            $isolated_network_id,
+            $local_site_id
+        ));
+        exit(1);
+    }
+} else {
+    $is_sovereign_tenant = (defined('WU_MT_SOVEREIGN_TENANT') && (int) WU_MT_SOVEREIGN_TENANT === $site_id)
+        || qw_payload_matches_sovereign_registry($site_id, $domain);
+    if (!$is_sovereign_tenant && $site_id !== get_current_blog_id()) {
+        fwrite(STDERR, sprintf(
+            "Payload site mismatch: URL resolved to blog %d, expected blog %d.\n",
+            get_current_blog_id(),
+            $site_id
+        ));
+        exit(1);
+    }
 }
 
 Job_Log::ensure_table();

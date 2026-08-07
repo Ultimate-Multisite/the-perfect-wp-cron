@@ -35,6 +35,7 @@ if ($queue_worker_running && !$job_executor_running) {
     return;
 }
 
+add_filter('wu_wp_cron_status_override', ['QueueWorker\\Socket_Client', 'filter_wp_cron_status_override']);
 add_action('init', ['QueueWorker\\Cron_Interceptor', 'register']);
 QueueWorker\Action_Scheduler_Bridge::register_stored_action_hook();
 add_action('action_scheduler_init', ['QueueWorker\\Action_Scheduler_Bridge', 'register']);
