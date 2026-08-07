@@ -281,8 +281,48 @@ class Job_Executor
         if (!$action_id || !class_exists('ActionScheduler_QueueRunner')) {
             throw new \RuntimeException('ActionScheduler not available or missing action_id');
         }
+
+        if (!$this->wait_for_action_scheduler_action($action_id)) {
+            return;
+        }
+
         $runner = \ActionScheduler_QueueRunner::instance();
         $runner->process_action($action_id);
+    }
+
+    /**
+     * Wait briefly for an action created inside another request's transaction.
+     *
+     * action_scheduler_stored_action fires before the surrounding transaction
+     * commits. A socket-triggered executor can therefore start while the action
+     * row is still invisible to its database connection. Passing that ID to the
+     * queue runner marks the action failed before its callback can run. A bounded
+     * wait preserves immediate dispatch; if the row remains unavailable, the
+     * regular scanner can pick it up after the transaction commits.
+     */
+    private function wait_for_action_scheduler_action(
+        int $action_id,
+        int $max_attempts = 20,
+        int $delay_microseconds = 250000
+    ): bool {
+        $store = \ActionScheduler::store();
+        $max_attempts = max(1, $max_attempts);
+
+        for ($attempt = 1; $attempt <= $max_attempts; $attempt++) {
+            try {
+                return \ActionScheduler_Store::STATUS_PENDING === $store->get_status($action_id);
+            } catch (\InvalidArgumentException $e) {
+                if ($attempt === $max_attempts) {
+                    return false;
+                }
+
+                if ($delay_microseconds > 0) {
+                    usleep($delay_microseconds);
+                }
+            }
+        }
+
+        return false;
     }
 
     private function set_alarm(): void

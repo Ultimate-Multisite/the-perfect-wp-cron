@@ -98,6 +98,55 @@ namespace {
             return $this->message;
         }
     }
+
+    class ActionScheduler_Store
+    {
+        public const STATUS_PENDING = 'pending';
+    }
+
+    class Test_ActionScheduler_Store
+    {
+        public array $statuses = [];
+        public array $action_ids = [];
+
+        public function get_status(int $action_id): string
+        {
+            $this->action_ids[] = $action_id;
+            $status = array_shift($this->statuses);
+
+            if ($status instanceof Throwable) {
+                throw $status;
+            }
+
+            return (string) $status;
+        }
+    }
+
+    class ActionScheduler
+    {
+        public static ?Test_ActionScheduler_Store $store = null;
+
+        public static function store(): Test_ActionScheduler_Store
+        {
+            return self::$store ??= new Test_ActionScheduler_Store();
+        }
+    }
+
+    class ActionScheduler_QueueRunner
+    {
+        public static ?self $runner = null;
+        public array $processed_action_ids = [];
+
+        public static function instance(): self
+        {
+            return self::$runner ??= new self();
+        }
+
+        public function process_action(int $action_id): void
+        {
+            $this->processed_action_ids[] = $action_id;
+        }
+    }
 }
 
 namespace {
@@ -920,6 +969,36 @@ namespace {
     assert_same(0.001, \Workerman\Timer::$delays[0] ?? null, 'Due Action Scheduler payloads must use a positive near-immediate timer delay');
 
     $executor = new QueueWorker\Job_Executor(1);
+    ActionScheduler::$store = new Test_ActionScheduler_Store();
+    ActionScheduler::$store->statuses = [
+        new InvalidArgumentException('Action is not committed yet'),
+        new InvalidArgumentException('Action is not committed yet'),
+        ActionScheduler_Store::STATUS_PENDING,
+    ];
+    assert_same(
+        true,
+        invoke_private($executor, 'wait_for_action_scheduler_action', [44, 3, 0]),
+        'An Action Scheduler row hidden by another request transaction must be retried until it becomes visible'
+    );
+    assert_same([44, 44, 44], ActionScheduler::$store->action_ids, 'Transaction visibility retries must check the same durable action ID');
+
+    ActionScheduler::$store = new Test_ActionScheduler_Store();
+    ActionScheduler::$store->statuses = [ActionScheduler_Store::STATUS_PENDING];
+    ActionScheduler_QueueRunner::$runner = new ActionScheduler_QueueRunner();
+    invoke_private($executor, 'execute_action_scheduler', [['action_id' => 45]]);
+    assert_same([45], ActionScheduler_QueueRunner::$runner->processed_action_ids, 'A visible pending Action Scheduler action must run normally');
+
+    ActionScheduler::$store = new Test_ActionScheduler_Store();
+    ActionScheduler::$store->statuses = [
+        new InvalidArgumentException('Missing action'),
+        new InvalidArgumentException('Missing action'),
+    ];
+    assert_same(
+        false,
+        invoke_private($executor, 'wait_for_action_scheduler_action', [46, 2, 0]),
+        'A still-invisible action must remain pending for the scanner instead of being passed to the queue runner'
+    );
+
     $stale_job = [
         'hook'      => 'stale_one_shot_hook',
         'args'      => ['a' => 1],
