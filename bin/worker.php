@@ -91,6 +91,7 @@ $worker->name  = 'the-perfect-wp-cron';
 $process = new Worker_Process($wp_load, $primary_domain, $execute_script, $scan_script);
 
 $worker->onWorkerStart = [$process, 'on_worker_start'];
+$worker->onWorkerStop  = [$process, 'on_worker_stop'];
 $worker->onMessage     = [$process, 'on_message'];
 
 Worker::runAll();

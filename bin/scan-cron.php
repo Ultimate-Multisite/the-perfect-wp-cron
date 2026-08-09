@@ -67,6 +67,7 @@ if (!class_exists('QueueWorker\\Config')) {
 }
 
 use QueueWorker\Bootstrap;
+use QueueWorker\Config;
 use QueueWorker\Cron_Event_Filter;
 use QueueWorker\Job_Payload;
 
@@ -90,9 +91,13 @@ define('QUEUE_WORKER_RUNNING', true);
 
 require_once $wp_load;
 
+$scheduling_horizon = max(1, (int) ($payload['scheduling_horizon'] ?? Config::scheduling_horizon()));
+$scan_timeout = max(1, (int) ($payload['scan_timeout'] ?? Config::scan_timeout()));
 $payloads = [];
 $isolated_network_id = (int) ($payload['isolated_network_id'] ?? 0);
-if ($isolated_network_id > 0) {
+if (!empty($payload['full_network'])) {
+    $payloads = qw_scan_full_network_jobs($scheduling_horizon, $scan_timeout);
+} elseif ($isolated_network_id > 0) {
     if (!defined('WU_MT_LEGACY_ISOLATED_NETWORK')
         || (int) WU_MT_LEGACY_ISOLATED_NETWORK !== $isolated_network_id
     ) {
@@ -113,7 +118,7 @@ if ($isolated_network_id > 0) {
             switch_to_blog($local_site_id);
         }
 
-        $payloads = array_merge($payloads, qw_scan_current_site_jobs());
+        $payloads = array_merge($payloads, qw_scan_current_site_jobs($scheduling_horizon));
 
         if ($switched) {
             restore_current_blog();
@@ -131,7 +136,7 @@ if ($isolated_network_id > 0) {
         switch_to_blog($site_id);
     }
 
-    $payloads = qw_scan_current_site_jobs();
+    $payloads = qw_scan_current_site_jobs($scheduling_horizon);
 }
 
 // A plugin can leave nested output buffers open. Discard every buffer opened
@@ -158,12 +163,68 @@ try {
 
 fwrite(STDOUT, $encoded_payloads);
 
-function qw_scan_current_site_jobs(): array
+function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): array
+{
+    $payloads = [];
+    $sovereign_sites = qw_scan_sovereign_site_entries();
+    $isolated_networks = qw_scan_isolated_network_entries();
+    $initial_blog_id = get_current_blog_id();
+    $site_ids = is_multisite() ? get_sites(['number' => 0, 'fields' => 'ids']) : [$initial_blog_id];
+
+    foreach ($site_ids as $site_id) {
+        $site_id = (int) $site_id;
+        if (isset($sovereign_sites[$site_id])) {
+            continue;
+        }
+
+        $site = get_site($site_id);
+        $network_id = $site ? (int) $site->site_id : 0;
+        if (isset($isolated_networks[$network_id])) {
+            continue;
+        }
+
+        $switched = $site_id !== get_current_blog_id();
+        if ($switched) {
+            switch_to_blog($site_id);
+        }
+        $payloads = array_merge($payloads, qw_scan_current_site_jobs($scheduling_horizon));
+        if ($switched) {
+            restore_current_blog();
+        }
+    }
+
+    if ($initial_blog_id !== get_current_blog_id()) {
+        switch_to_blog($initial_blog_id);
+    }
+
+    foreach ($sovereign_sites as $site_id => $entry) {
+        $payloads = array_merge($payloads, qw_scan_registry_jobs([
+            'site_id'             => (int) $site_id,
+            'site_url'            => qw_scan_site_url_from_registry_entry($entry),
+            'scheduling_horizon'  => $scheduling_horizon,
+            'scan_timeout'        => $scan_timeout,
+        ], 'sovereign site ' . $site_id, $scan_timeout));
+    }
+
+    foreach ($isolated_networks as $network_id => $entry) {
+        $payloads = array_merge($payloads, qw_scan_registry_jobs([
+            'isolated_network_id' => (int) $network_id,
+            'site_url'            => qw_scan_site_url_from_registry_entry($entry),
+            'scheduling_horizon'  => $scheduling_horizon,
+            'scan_timeout'        => $scan_timeout,
+        ], 'isolated network ' . $network_id, $scan_timeout));
+    }
+
+    return $payloads;
+}
+
+function qw_scan_current_site_jobs(int $scheduling_horizon): array
 {
     wp_cache_delete('cron', 'options');
     wp_cache_delete('alloptions', 'options');
 
     $payloads = [];
+    $deadline = time() + $scheduling_horizon;
     $crons = _get_cron_array();
     if (is_array($crons)) {
         $seen_cron_signatures = [];
@@ -176,6 +237,9 @@ function qw_scan_current_site_jobs(): array
                     continue;
                 }
                 foreach ($events as $event) {
+                    if ((int) $timestamp > $deadline) {
+                        continue;
+                    }
                     $signature = qw_scan_cron_event_signature($hook, $event, (int) $timestamp);
                     if (isset($seen_cron_signatures[$signature])) {
                         continue;
@@ -200,9 +264,11 @@ function qw_scan_current_site_jobs(): array
             ]);
             foreach ($actions as $action_id => $action) {
                 $action_payload = Job_Payload::from_as_action($action_id);
-                if ($action_payload) {
-                    $payloads[] = json_decode($action_payload->to_json(), true);
+                if (!$action_payload || $action_payload->timestamp > $deadline) {
+                    continue;
                 }
+
+                $payloads[] = json_decode($action_payload->to_json(), true);
             }
         } catch (\Throwable $e) {
             fwrite(STDERR, "Action Scheduler scan failed: " . $e->getMessage() . "\n");
@@ -210,6 +276,192 @@ function qw_scan_current_site_jobs(): array
     }
 
     return $payloads;
+}
+
+function qw_scan_sovereign_site_entries(): array
+{
+    if (!defined('WP_CONTENT_DIR')) {
+        return [];
+    }
+
+    $data = qw_scan_registry_data(WP_CONTENT_DIR . '/site-registry.data.json');
+    if (empty($data['sites']) || !is_array($data['sites'])) {
+        return [];
+    }
+
+    $entries = [];
+    foreach ($data['sites'] as $site_id => $entry) {
+        if (!is_array($entry)
+            || ($entry['isolation_model'] ?? '') !== 'sovereign'
+            || ($entry['status'] ?? 'active') !== 'active'
+            || qw_scan_site_url_from_registry_entry($entry) === ''
+        ) {
+            continue;
+        }
+        $entries[(int) $site_id] = $entry;
+    }
+
+    return $entries;
+}
+
+function qw_scan_isolated_network_entries(): array
+{
+    if (!defined('WP_CONTENT_DIR')) {
+        return [];
+    }
+
+    $data = qw_scan_registry_data(WP_CONTENT_DIR . '/network-registry.data.json');
+    if (empty($data['networks']) || !is_array($data['networks'])) {
+        return [];
+    }
+
+    $entries = [];
+    foreach ($data['networks'] as $registry_id => $entry) {
+        if (!is_array($entry)
+            || ($entry['tier'] ?? '') !== 'isolated'
+            || ($entry['status'] ?? 'active') !== 'active'
+            || qw_scan_site_url_from_registry_entry($entry) === ''
+        ) {
+            continue;
+        }
+
+        $network_id = (int) ($entry['network_id'] ?? $entry['id'] ?? $registry_id);
+        if ($network_id > 0) {
+            $entries[$network_id] = $entry;
+        }
+    }
+
+    return $entries;
+}
+
+function qw_scan_registry_data(string $path): array
+{
+    if (!is_readable($path)) {
+        return [];
+    }
+
+    $data = json_decode((string) file_get_contents($path), true);
+    return is_array($data) ? $data : [];
+}
+
+function qw_scan_site_url_from_registry_entry(array $entry): string
+{
+    $domains = $entry['domains'] ?? [];
+    if (!is_array($domains)) {
+        $domains = [];
+    }
+    if (!empty($entry['domain'])) {
+        array_unshift($domains, $entry['domain']);
+    }
+
+    foreach ($domains as $domain) {
+        $domain = trim((string) $domain);
+        if ($domain !== '') {
+            return 'https://' . $domain . '/';
+        }
+    }
+
+    return '';
+}
+
+function qw_scan_registry_jobs(array $payload, string $description, int $scan_timeout): array
+{
+    $process = proc_open([PHP_BINARY, __FILE__, '--stdin'], [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ], $pipes);
+    if (!is_resource($process)) {
+        fwrite(STDERR, sprintf("Could not start scanner for %s.\n", $description));
+        return [];
+    }
+
+    $encoded_payload = json_encode($payload);
+    if ($encoded_payload === false || fwrite($pipes[0], $encoded_payload) === false) {
+        fclose($pipes[0]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_terminate($process, 9);
+        proc_close($process);
+        fwrite(STDERR, sprintf("Could not configure scanner for %s.\n", $description));
+        return [];
+    }
+
+    fclose($pipes[0]);
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    $stdout = '';
+    $stderr = '';
+    $started = time();
+    do {
+        $out = stream_get_contents($pipes[1]);
+        if ($out !== false && $out !== '') {
+            $stdout .= $out;
+        }
+        $err = stream_get_contents($pipes[2]);
+        if ($err !== false && $err !== '') {
+            $stderr .= $err;
+        }
+
+        $status = proc_get_status($process);
+        if (!$status['running']) {
+            break;
+        }
+        if (time() - $started > $scan_timeout) {
+            proc_terminate($process, 9);
+            fwrite(STDERR, sprintf("Scanner for %s exceeded %d seconds.\n", $description, $scan_timeout));
+            break;
+        }
+        usleep(10000);
+    } while (true);
+
+    $remaining = stream_get_contents($pipes[1]);
+    if ($remaining !== false && $remaining !== '') {
+        $stdout .= $remaining;
+    }
+    $remaining_error = stream_get_contents($pipes[2]);
+    if ($remaining_error !== false && $remaining_error !== '') {
+        $stderr .= $remaining_error;
+    }
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $close_code = proc_close($process);
+    $exit_code = (int) ($status['exitcode'] ?? $close_code);
+    if ($exit_code === -1) {
+        $exit_code = $close_code;
+    }
+
+    if ($exit_code !== 0 || $stdout === '') {
+        fwrite(STDERR, sprintf(
+            "Scanner for %s failed (exit %d, stdout_bytes=%d, stderr_bytes=%d).\n",
+            $description,
+            $exit_code,
+            strlen($stdout),
+            strlen($stderr)
+        ));
+        return [];
+    }
+
+    try {
+        $jobs = json_decode($stdout, true, 512, JSON_THROW_ON_ERROR);
+    } catch (\JsonException $e) {
+        fwrite(STDERR, sprintf("Scanner for %s returned invalid JSON.\n", $description));
+        return [];
+    }
+
+    if (!array_is_list($jobs)) {
+        fwrite(STDERR, sprintf("Scanner for %s returned an invalid payload shape.\n", $description));
+        return [];
+    }
+
+    foreach ($jobs as $job) {
+        if (!is_array($job)) {
+            fwrite(STDERR, sprintf("Scanner for %s returned an invalid payload shape.\n", $description));
+            return [];
+        }
+    }
+
+    return $jobs;
 }
 
 function qw_scan_action_scheduler_tables_exist(): bool
