@@ -1042,7 +1042,7 @@ class Worker_Process
 
         $status = proc_get_status($scan['process']);
         if ($status['running']) {
-            if (time() - $scan['started'] > $this->scan_timeout) {
+            if (time() - $scan['started'] >= $this->scan_timeout) {
                 $pid = (int) ($status['pid'] ?? 0);
                 $this->terminate_active_scan();
                 Worker::log(sprintf(

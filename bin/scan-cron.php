@@ -166,6 +166,7 @@ fwrite(STDOUT, $encoded_payloads);
 function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): array
 {
     $payloads = [];
+    $deadline = time() + $scan_timeout;
     $sovereign_sites = qw_scan_sovereign_site_entries();
     $isolated_networks = qw_scan_isolated_network_entries();
     $initial_blog_id = get_current_blog_id();
@@ -187,7 +188,9 @@ function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): 
         if ($switched) {
             switch_to_blog($site_id);
         }
-        $payloads = array_merge($payloads, qw_scan_current_site_jobs($scheduling_horizon));
+        foreach (qw_scan_current_site_jobs($scheduling_horizon) as $payload) {
+            $payloads[] = $payload;
+        }
         if ($switched) {
             restore_current_blog();
         }
@@ -198,21 +201,39 @@ function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): 
     }
 
     foreach ($sovereign_sites as $site_id => $entry) {
-        $payloads = array_merge($payloads, qw_scan_registry_jobs([
+        $remaining = $deadline - time();
+        if ($remaining <= 0) {
+            fwrite(STDERR, sprintf("Scan budget exhausted before sovereign site %d.\n", $site_id));
+            return $payloads;
+        }
+
+        $site_payloads = qw_scan_registry_jobs([
             'site_id'             => (int) $site_id,
             'site_url'            => qw_scan_site_url_from_registry_entry($entry),
             'scheduling_horizon'  => $scheduling_horizon,
-            'scan_timeout'        => $scan_timeout,
-        ], 'sovereign site ' . $site_id, $scan_timeout));
+            'scan_timeout'        => $remaining,
+        ], 'sovereign site ' . $site_id, $remaining);
+        foreach ($site_payloads as $payload) {
+            $payloads[] = $payload;
+        }
     }
 
     foreach ($isolated_networks as $network_id => $entry) {
-        $payloads = array_merge($payloads, qw_scan_registry_jobs([
+        $remaining = $deadline - time();
+        if ($remaining <= 0) {
+            fwrite(STDERR, sprintf("Scan budget exhausted before isolated network %d.\n", $network_id));
+            return $payloads;
+        }
+
+        $network_payloads = qw_scan_registry_jobs([
             'isolated_network_id' => (int) $network_id,
             'site_url'            => qw_scan_site_url_from_registry_entry($entry),
             'scheduling_horizon'  => $scheduling_horizon,
-            'scan_timeout'        => $scan_timeout,
-        ], 'isolated network ' . $network_id, $scan_timeout));
+            'scan_timeout'        => $remaining,
+        ], 'isolated network ' . $network_id, $remaining);
+        foreach ($network_payloads as $payload) {
+            $payloads[] = $payload;
+        }
     }
 
     return $payloads;
@@ -229,6 +250,9 @@ function qw_scan_current_site_jobs(int $scheduling_horizon): array
     if (is_array($crons)) {
         $seen_cron_signatures = [];
         foreach ($crons as $timestamp => $hooks) {
+            if ((int) $timestamp > $deadline) {
+                continue;
+            }
             if (!is_array($hooks)) {
                 continue;
             }
@@ -237,9 +261,6 @@ function qw_scan_current_site_jobs(int $scheduling_horizon): array
                     continue;
                 }
                 foreach ($events as $event) {
-                    if ((int) $timestamp > $deadline) {
-                        continue;
-                    }
                     $signature = qw_scan_cron_event_signature($hook, $event, (int) $timestamp);
                     if (isset($seen_cron_signatures[$signature])) {
                         continue;
@@ -407,7 +428,7 @@ function qw_scan_registry_jobs(array $payload, string $description, int $scan_ti
         if (!$status['running']) {
             break;
         }
-        if (time() - $started > $scan_timeout) {
+        if (time() - $started >= $scan_timeout) {
             proc_terminate($process, 9);
             fwrite(STDERR, sprintf("Scanner for %s exceeded %d seconds.\n", $description, $scan_timeout));
             break;

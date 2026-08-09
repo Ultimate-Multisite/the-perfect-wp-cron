@@ -613,7 +613,7 @@ namespace {
         'site_url'  => 'https://tenant.example.test',
         'hook'      => 'beyond_horizon_hook',
         'args'      => [],
-        'timestamp' => time() + 61,
+        'timestamp' => time() + 3600,
         'source'    => 'wp_cron',
     ])]);
     assert_same(
@@ -811,7 +811,22 @@ namespace {
     assert_same(false, private_property($async_scan_worker, 'is_rescanning'), 'The scanner must finish through non-blocking process polling');
     assert_same(1, count(private_property($async_scan_worker, 'pending_timers')), 'A completed scanner must schedule validated in-horizon jobs');
 
-    assert_true(false !== file_put_contents($async_scan_fixture, '<?php sleep(5); fwrite(STDOUT, "[]");'), 'Shutdown scan fixture must be writable');
+    assert_true(false !== file_put_contents($async_scan_fixture, '<?php sleep(5); fwrite(STDOUT, "[]");'), 'Timeout and shutdown scan fixture must be writable');
+    $timeout_scan_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $async_scan_fixture);
+    set_private_property($timeout_scan_worker, 'scan_timeout', 1);
+    \Workerman\Worker::$logs = [];
+    invoke_private($timeout_scan_worker, 'run_full_rescan', [0]);
+    $active_timeout_scan = private_property($timeout_scan_worker, 'active_scan_process');
+    $active_timeout_scan['started'] = time() - 2;
+    set_private_property($timeout_scan_worker, 'active_scan_process', $active_timeout_scan);
+    invoke_private($timeout_scan_worker, 'poll_processes', [0]);
+    assert_same(null, private_property($timeout_scan_worker, 'active_scan_process'), 'An expired scanner must be terminated and reaped');
+    assert_same(false, private_property($timeout_scan_worker, 'is_rescanning'), 'An expired scanner must clear the rescan state');
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), '[RESCAN][TIMEOUT]'),
+        'An expired scanner must emit a bounded timeout diagnostic'
+    );
+
     $shutdown_scan_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $async_scan_fixture);
     invoke_private($shutdown_scan_worker, 'run_full_rescan', [0]);
     $shutdown_scan_worker->on_worker_stop();
