@@ -559,6 +559,7 @@ namespace {
     ]);
     assert_same($cron_route_a->tracking_key(), $cron_route_b->tracking_key(), 'WP-Cron identity must not depend on its bootstrap URL');
 
+    putenv('QUEUE_WORKER_SCHEDULING_HORIZON=2147483647');
     $failed_bootstrap_file = tempnam(sys_get_temp_dir(), 'qw-bootstrap-failure-');
     assert_true(false !== $failed_bootstrap_file, 'Bootstrap failure fixture must be created');
     assert_true(
@@ -597,6 +598,29 @@ namespace {
     invoke_private($identity_worker, 'schedule_timer', [$cron_route_a]);
     invoke_private($identity_worker, 'schedule_timer', [$cron_route_b]);
     assert_same(1, count(private_property($identity_worker, 'pending_timers')), 'Route variants of one WP-Cron event must collapse to one timer');
+    $horizon_worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
+    set_private_property($horizon_worker, 'scheduling_horizon', 60);
+    invoke_private($horizon_worker, 'schedule_timer', [new Job_Payload([
+        'site_id'   => 7,
+        'site_url'  => 'https://tenant.example.test',
+        'hook'      => 'within_horizon_hook',
+        'args'      => [],
+        'timestamp' => time() + 30,
+        'source'    => 'wp_cron',
+    ])]);
+    invoke_private($horizon_worker, 'schedule_timer', [new Job_Payload([
+        'site_id'   => 7,
+        'site_url'  => 'https://tenant.example.test',
+        'hook'      => 'beyond_horizon_hook',
+        'args'      => [],
+        'timestamp' => time() + 3600,
+        'source'    => 'wp_cron',
+    ])]);
+    assert_same(
+        1,
+        count(private_property($horizon_worker, 'pending_timers')),
+        'The worker must not retain timers beyond its bounded scheduling horizon'
+    );
 
     Worker_Process::ensure_lock_table();
     assert_true(
@@ -745,6 +769,69 @@ namespace {
         'Sovereign scan script must isolate bootstrap output and fail safely when encoding JSON'
     );
     assert_true(unlink($scan_fixture), 'Sovereign scan fixture must be removed');
+    assert_true(
+        str_contains($scan_script, 'qw_scan_full_network_jobs($scheduling_horizon, $scan_timeout)')
+            && str_contains($scan_script, 'qw_scan_registry_jobs([')
+            && str_contains($scan_script, '$deadline = time() + $scheduling_horizon;'),
+        'The scanner subprocess must enumerate the full network and reject jobs beyond the scheduling horizon'
+    );
+
+    $async_scan_fixture = tempnam(sys_get_temp_dir(), 'qw-async-scan-');
+    assert_true(false !== $async_scan_fixture, 'Asynchronous scan fixture must be created');
+    $async_scan_output = json_encode([[
+        'site_id'   => 7,
+        'site_url'  => 'https://tenant.example.test',
+        'hook'      => 'async_scan_hook',
+        'args'      => [],
+        'timestamp' => time() + 30,
+        'source'    => 'wp_cron',
+    ]]);
+    assert_true(false !== file_put_contents(
+        $async_scan_fixture,
+        '<?php usleep(1000000); fwrite(STDOUT, ' . var_export($async_scan_output, true) . ');'
+    ), 'Asynchronous scan fixture must be writable');
+    $async_scan_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $async_scan_fixture);
+    set_private_property($async_scan_worker, 'scheduling_horizon', 60);
+    \Workerman\Timer::$delays = [];
+    \Workerman\Worker::$logs = [];
+    $async_scan_started = microtime(true);
+    invoke_private($async_scan_worker, 'run_full_rescan', [0]);
+    assert_true(microtime(true) - $async_scan_started < 0.5, 'Starting a full-network scan must not block the event loop');
+    assert_same(true, private_property($async_scan_worker, 'is_rescanning'), 'An active scanner subprocess must be visible in worker state');
+    invoke_private($async_scan_worker, 'run_full_rescan', [0]);
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'skipping overlap'),
+        'A periodic tick must not overlap an active full-network scan'
+    );
+    $async_scan_deadline = microtime(true) + 3;
+    while (private_property($async_scan_worker, 'is_rescanning') && microtime(true) < $async_scan_deadline) {
+        usleep(20000);
+        invoke_private($async_scan_worker, 'poll_processes', [0]);
+    }
+    assert_same(false, private_property($async_scan_worker, 'is_rescanning'), 'The scanner must finish through non-blocking process polling');
+    assert_same(1, count(private_property($async_scan_worker, 'pending_timers')), 'A completed scanner must schedule validated in-horizon jobs');
+
+    assert_true(false !== file_put_contents($async_scan_fixture, '<?php sleep(5); fwrite(STDOUT, "[]");'), 'Timeout and shutdown scan fixture must be writable');
+    $timeout_scan_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $async_scan_fixture);
+    set_private_property($timeout_scan_worker, 'scan_timeout', 1);
+    \Workerman\Worker::$logs = [];
+    invoke_private($timeout_scan_worker, 'run_full_rescan', [0]);
+    $active_timeout_scan = private_property($timeout_scan_worker, 'active_scan_process');
+    $active_timeout_scan['started'] = time() - 2;
+    set_private_property($timeout_scan_worker, 'active_scan_process', $active_timeout_scan);
+    invoke_private($timeout_scan_worker, 'poll_processes', [0]);
+    assert_same(null, private_property($timeout_scan_worker, 'active_scan_process'), 'An expired scanner must be terminated and reaped');
+    assert_same(false, private_property($timeout_scan_worker, 'is_rescanning'), 'An expired scanner must clear the rescan state');
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), '[RESCAN][TIMEOUT]'),
+        'An expired scanner must emit a bounded timeout diagnostic'
+    );
+
+    $shutdown_scan_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $async_scan_fixture);
+    invoke_private($shutdown_scan_worker, 'run_full_rescan', [0]);
+    $shutdown_scan_worker->on_worker_stop();
+    assert_same(null, private_property($shutdown_scan_worker, 'active_scan_process'), 'Worker shutdown must terminate and reap the scanner subprocess');
+    assert_true(unlink($async_scan_fixture), 'Asynchronous scan fixture must be removed');
 
     \Workerman\Timer::$delays = [];
     $registry_content_dir = sys_get_temp_dir() . '/qw-regression-content-' . getmypid();
@@ -879,7 +966,7 @@ namespace {
     assert_true(
         str_contains($scan_script, "defined('WU_MT_LEGACY_ISOLATED_NETWORK')")
             && str_contains($scan_script, "get_sites(['number' => 0, 'fields' => 'ids'])")
-            && str_contains($scan_script, 'qw_scan_current_site_jobs()'),
+            && str_contains($scan_script, 'qw_scan_current_site_jobs($scheduling_horizon)'),
         'Isolated scanner bootstrap must validate the routed network and enumerate every tenant-local site'
     );
     assert_true(
@@ -1189,6 +1276,21 @@ namespace {
     assert_true(!isset($GLOBALS['test_crons'][$recurring_timestamp]), 'A stale recurring duplicate must be removed after its malformed successor is normalized');
     assert_true(isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_malformed_successor_hook'][$recurring_key]), 'A malformed recurring successor key must be repaired to WordPress canonical form');
     assert_true(!isset($GLOBALS['test_crons'][$recurring_target]['duplicate_recurring_malformed_successor_hook'][$malformed_successor_key]), 'The malformed recurring successor key must be removed after repair');
+
+    putenv('QUEUE_WORKER_SCHEDULING_HORIZON');
+    putenv('QUEUE_WORKER_RESCAN_INTERVAL');
+    assert_same(3600, Config::scheduling_horizon(), 'Scheduling horizon must default to one hour');
+    putenv('QUEUE_WORKER_SCHEDULING_HORIZON=12');
+    assert_same(60, Config::scheduling_horizon(), 'Scheduling horizon must not be shorter than the rescan interval');
+    putenv('QUEUE_WORKER_RESCAN_INTERVAL=10');
+    assert_same(12, Config::scheduling_horizon(), 'Scheduling horizon must remain configurable above the rescan interval');
+    putenv('QUEUE_WORKER_SCAN_TIMEOUT');
+    assert_same(300, Config::scan_timeout(), 'Full-network scan timeout must default to five minutes');
+    putenv('QUEUE_WORKER_SCAN_TIMEOUT=0');
+    assert_same(1, Config::scan_timeout(), 'Full-network scan timeout must be clamped to at least one second');
+    putenv('QUEUE_WORKER_SCAN_TIMEOUT');
+    putenv('QUEUE_WORKER_RESCAN_INTERVAL');
+    putenv('QUEUE_WORKER_SCHEDULING_HORIZON=2147483647');
 
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL');
     assert_same(5, Config::action_scheduler_rescan_interval(), 'AS rescan interval must default to five seconds');

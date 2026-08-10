@@ -150,6 +150,16 @@ class Config
         return (int) self::get('QUEUE_WORKER_RESCAN_INTERVAL', 60);
     }
 
+    public static function scheduling_horizon(): int
+    {
+        return max(1, self::rescan_interval(), (int) self::get('QUEUE_WORKER_SCHEDULING_HORIZON', 3600));
+    }
+
+    public static function scan_timeout(): int
+    {
+        return max(1, (int) self::get('QUEUE_WORKER_SCAN_TIMEOUT', 300));
+    }
+
     public static function action_scheduler_rescan_interval(): int
     {
         return max(1, (int) self::get('QUEUE_WORKER_AS_RESCAN_INTERVAL', 5));

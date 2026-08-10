@@ -42,6 +42,8 @@ class Worker_Process
     private int $as_rescan_interval;
     private int $batch_timeout;
     private int $rescan_interval;
+    private int $scheduling_horizon;
+    private int $scan_timeout;
     private int $memory_limit;
     private int $uptime_limit;
 
@@ -64,6 +66,8 @@ class Worker_Process
     private int $running_jobs = 0;
     private int $start_time;
     private bool $is_rescanning = false;
+    /** @var array{process: resource, pipes: array, started: int, stdout: string, stderr: string}|null */
+    private ?array $active_scan_process = null;
     private int $last_rescan_started = 0;
     private int $last_rescan_finished = 0;
     private int $last_rescan_duration = 0;
@@ -92,6 +96,8 @@ class Worker_Process
         $this->as_rescan_interval = Config::action_scheduler_rescan_interval();
         $this->batch_timeout   = Config::batch_timeout();
         $this->rescan_interval = Config::rescan_interval();
+        $this->scheduling_horizon = Config::scheduling_horizon();
+        $this->scan_timeout    = Config::scan_timeout();
         $this->memory_limit    = Config::memory_limit();
         $this->uptime_limit    = Config::uptime_limit();
         $this->start_time      = time();
@@ -129,7 +135,8 @@ class Worker_Process
         // lane so due AS jobs are not starved behind noisy WP-Cron batches.
         Timer::add(1, fn() => $this->flush_batches());
 
-        // Subprocess polling timer — every 0.5 seconds
+        // Subprocess polling timer — every 0.5 seconds. Full-network scans use
+        // the same non-blocking poll cycle so they cannot stall this event loop.
         Timer::add(0.5, fn() => $this->poll_processes($worker_id));
 
         // Initial DB scan. Only one coordinator worker performs the expensive
@@ -138,7 +145,7 @@ class Worker_Process
         if ($this->is_rescan_coordinator($worker_id)) {
             Worker::log(sprintf('[W%d] Scanning database for pending jobs...', $worker_id));
             $this->run_full_rescan($worker_id);
-            Worker::log(sprintf('[W%d] Loaded %d pending jobs.', $worker_id, count($this->pending_timers)));
+            Worker::log(sprintf('[W%d] Full-network scan started in a subprocess.', $worker_id));
         } else {
             Worker::log(sprintf('[W%d] Skipping full-network scan; worker 0 is rescan coordinator.', $worker_id));
         }
@@ -210,6 +217,14 @@ class Worker_Process
         }
     }
 
+    /**
+     * Workerman onWorkerStop callback.
+     */
+    public function on_worker_stop(): void
+    {
+        $this->terminate_active_scan();
+    }
+
     // ------------------------------------------------------------------
     // Private methods
     // ------------------------------------------------------------------
@@ -255,6 +270,10 @@ class Worker_Process
                 ));
                 $this->unroutable_sites_logged[$payload->site_id] = true;
             }
+            return;
+        }
+
+        if ($payload->timestamp > time() + $this->scheduling_horizon) {
             return;
         }
 
@@ -732,6 +751,8 @@ class Worker_Process
      */
     private function poll_processes(int $worker_id): void
     {
+        $this->poll_full_rescan($worker_id);
+
         foreach ($this->running_processes as $i => $proc) {
             $cron_site_lock_owner = $proc['cron_site_lock_owner'];
             $lock_refreshed = $proc['cron_site_lock_refreshed'];
@@ -944,16 +965,215 @@ class Worker_Process
             return;
         }
 
+        if ($this->active_scan_process !== null) {
+            Worker::log(sprintf('[W%d][RESCAN] Scanner process is still active; skipping overlap.', $worker_id));
+            return;
+        }
+
         $this->is_rescanning = true;
         $this->last_rescan_started = time();
 
-        try {
-            $this->rescan_all_jobs();
-        } finally {
-            $this->last_rescan_finished = time();
-            $this->last_rescan_duration = max(0, $this->last_rescan_finished - $this->last_rescan_started);
-            $this->is_rescanning = false;
+        if (!$this->start_full_rescan($worker_id)) {
+            $this->finish_full_rescan();
         }
+    }
+
+    private function start_full_rescan(int $worker_id): bool
+    {
+        if ($this->scan_script === '' || !file_exists($this->scan_script)) {
+            Worker::log(sprintf('[W%d][RESCAN][ERROR] Missing full-network scan script.', $worker_id));
+            return false;
+        }
+
+        $process = proc_open([PHP_BINARY, $this->scan_script, '--stdin'], [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ], $pipes);
+
+        if (!is_resource($process)) {
+            Worker::log(sprintf('[W%d][RESCAN][ERROR] Failed to spawn full-network scanner.', $worker_id));
+            return false;
+        }
+
+        $payload = json_encode([
+            'site_url'           => 'https://' . $this->primary_domain . '/',
+            'full_network'       => true,
+            'scheduling_horizon' => $this->scheduling_horizon,
+            'scan_timeout'       => $this->scan_timeout,
+        ]);
+        if ($payload === false || fwrite($pipes[0], $payload) === false) {
+            fclose($pipes[0]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            proc_terminate($process, 9);
+            proc_close($process);
+            Worker::log(sprintf('[W%d][RESCAN][ERROR] Failed to send scanner configuration.', $worker_id));
+            return false;
+        }
+
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+        $this->active_scan_process = [
+            'process' => $process,
+            'pipes'   => $pipes,
+            'started' => time(),
+            'stdout'  => '',
+            'stderr'  => '',
+        ];
+
+        return true;
+    }
+
+    private function poll_full_rescan(int $worker_id): void
+    {
+        if ($this->active_scan_process === null) {
+            return;
+        }
+
+        $scan = $this->active_scan_process;
+        foreach ([1 => 'stdout', 2 => 'stderr'] as $pipe_id => $stream) {
+            $output = stream_get_contents($scan['pipes'][$pipe_id]);
+            if ($output !== false && $output !== '') {
+                $this->active_scan_process[$stream] .= $output;
+            }
+        }
+
+        $status = proc_get_status($scan['process']);
+        if ($status['running']) {
+            if (time() - $scan['started'] >= $this->scan_timeout) {
+                $pid = (int) ($status['pid'] ?? 0);
+                $this->terminate_active_scan();
+                Worker::log(sprintf(
+                    '[W%d][RESCAN][TIMEOUT] Full-network scan exceeded %ds limit (pid %d).',
+                    $worker_id,
+                    $this->scan_timeout,
+                    $pid
+                ));
+                $this->finish_full_rescan();
+            }
+            return;
+        }
+
+        foreach ([1 => 'stdout', 2 => 'stderr'] as $pipe_id => $stream) {
+            $remaining = stream_get_contents($scan['pipes'][$pipe_id]);
+            if ($remaining !== false && $remaining !== '') {
+                $this->active_scan_process[$stream] .= $remaining;
+            }
+            fclose($scan['pipes'][$pipe_id]);
+        }
+        $close_code = proc_close($scan['process']);
+
+        $stdout = $this->active_scan_process['stdout'];
+        $stderr = $this->active_scan_process['stderr'];
+        $this->active_scan_process = null;
+        $exit_code = (int) $status['exitcode'];
+        if ($exit_code === -1) {
+            $exit_code = $close_code;
+        }
+
+        if ($exit_code !== 0) {
+            Worker::log(sprintf(
+                '[W%d][RESCAN][FAIL] Full-network scanner exited with code %d (%s).',
+                $worker_id,
+                $exit_code,
+                $this->sovereign_scan_diagnostic('stderr', $stderr)
+            ));
+            $this->finish_full_rescan();
+            return;
+        }
+
+        if ($stderr !== '') {
+            Worker::log(sprintf(
+                '[W%d][RESCAN][WARN] Full-network scanner reported partial failures (%s).',
+                $worker_id,
+                $this->sovereign_scan_diagnostic('stderr', $stderr)
+            ));
+        }
+
+        $scheduled = $this->schedule_scan_output($stdout, $stderr, $worker_id);
+        Worker::log(sprintf(
+            '[W%d][RESCAN][DONE] Loaded %d jobs within the %ds scheduling horizon.',
+            $worker_id,
+            $scheduled,
+            $this->scheduling_horizon
+        ));
+        $this->finish_full_rescan();
+    }
+
+    private function schedule_scan_output(string $stdout, string $stderr, int $worker_id): int
+    {
+        if ($stdout === '') {
+            Worker::log(sprintf(
+                '[W%d][RESCAN][FAIL] Full-network scanner returned empty output (%s).',
+                $worker_id,
+                $this->sovereign_scan_diagnostic('stderr', $stderr)
+            ));
+            return 0;
+        }
+
+        try {
+            $payloads = json_decode($stdout, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            Worker::log(sprintf(
+                '[W%d][RESCAN][FAIL] Full-network scanner returned invalid JSON (%s; %s; %s).',
+                $worker_id,
+                $e->getMessage(),
+                $this->sovereign_scan_diagnostic('stdout', $stdout),
+                $this->sovereign_scan_diagnostic('stderr', $stderr)
+            ));
+            return 0;
+        }
+
+        if (!array_is_list($payloads)) {
+            Worker::log(sprintf('[W%d][RESCAN][FAIL] Full-network scanner returned an invalid payload shape.', $worker_id));
+            return 0;
+        }
+
+        $validated_payloads = [];
+        foreach ($payloads as $payload_data) {
+            if (!is_array($payload_data)) {
+                Worker::log(sprintf('[W%d][RESCAN][FAIL] Full-network scanner returned an invalid payload shape.', $worker_id));
+                return 0;
+            }
+            try {
+                $validated_payloads[] = new Job_Payload($payload_data);
+            } catch (\Throwable $e) {
+                Worker::log(sprintf('[W%d][RESCAN][FAIL] Full-network scanner returned invalid routing metadata (%s).', $worker_id, $e->getMessage()));
+                return 0;
+            }
+        }
+
+        $pending_before = count($this->pending_timers);
+        foreach ($validated_payloads as $payload) {
+            $this->schedule_timer($payload);
+        }
+
+        return count($this->pending_timers) - $pending_before;
+    }
+
+    private function finish_full_rescan(): void
+    {
+        $this->last_rescan_finished = time();
+        $this->last_rescan_duration = max(0, $this->last_rescan_finished - $this->last_rescan_started);
+        $this->is_rescanning = false;
+    }
+
+    private function terminate_active_scan(): void
+    {
+        if ($this->active_scan_process === null) {
+            return;
+        }
+
+        proc_terminate($this->active_scan_process['process'], 9);
+        foreach ([1, 2] as $pipe_id) {
+            if (is_resource($this->active_scan_process['pipes'][$pipe_id])) {
+                fclose($this->active_scan_process['pipes'][$pipe_id]);
+            }
+        }
+        proc_close($this->active_scan_process['process']);
+        $this->active_scan_process = null;
     }
 
     /**
@@ -1445,6 +1665,7 @@ class Worker_Process
                     'running_details' => $running_details,
                     'rescan'          => [
                         'in_progress' => $this->is_rescanning,
+                        'horizon' => $this->scheduling_horizon,
                         'last_started' => $this->last_rescan_started,
                         'last_finished' => $this->last_rescan_finished,
                         'last_duration' => $this->last_rescan_duration,

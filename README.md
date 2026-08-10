@@ -102,6 +102,8 @@ Every setting can be configured via PHP constant (in `wp-config.php`) or environ
 | `QUEUE_WORKER_JOB_TIMEOUT` | `300` | Per-job timeout in seconds (SIGALRM) |
 | `QUEUE_WORKER_BATCH_TIMEOUT` | `3600` | Subprocess timeout in seconds (safety net) |
 | `QUEUE_WORKER_RESCAN_INTERVAL` | `60` | Seconds between database rescans |
+| `QUEUE_WORKER_SCHEDULING_HORIZON` | `3600` | Only keep timers for jobs due within this many seconds; never shorter than the rescan interval |
+| `QUEUE_WORKER_SCAN_TIMEOUT` | `300` | Full-network scanner subprocess timeout in seconds |
 | `QUEUE_WORKER_MEMORY_LIMIT` | `200` | Memory limit in MB before auto-restart |
 | `QUEUE_WORKER_UPTIME_LIMIT` | `3600` | Max uptime in seconds before auto-restart |
 | `QUEUE_WORKER_LOG_FILE` | auto-detect | Path to log for admin viewer |
