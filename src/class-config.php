@@ -124,10 +124,14 @@ class Config
 
     public static function bypass_cron_hooks(): array
     {
-        return array_values(array_unique(array_merge(
+        $bypassed = array_values(array_unique(array_merge(
             self::DEFAULT_BYPASS_CRON_HOOKS,
             self::normalize_string_list(self::get('QUEUE_WORKER_BYPASS_CRON_HOOKS', []))
         )));
+
+        $managed = self::normalize_string_list(self::get('QUEUE_WORKER_MANAGED_CRON_HOOKS', []));
+
+        return array_values(array_diff($bypassed, $managed));
     }
 
     public static function max_batch_size(): int

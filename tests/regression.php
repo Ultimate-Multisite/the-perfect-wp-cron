@@ -1307,6 +1307,12 @@ namespace {
     assert_true(Cron_Event_Filter::should_bypass('custom_hook'), 'Configured bypass hook must be skipped by shared cron filter');
     assert_true(Cron_Event_Filter::should_bypass('extra_hook'), 'Comma-separated bypass hooks must be normalized');
     putenv('QUEUE_WORKER_BYPASS_CRON_HOOKS');
+    putenv('QUEUE_WORKER_MANAGED_CRON_HOOKS=wp_version_check, wp_update_plugins, wp_update_themes');
+    assert_true(!Cron_Event_Filter::should_bypass('wp_version_check'), 'Managed core update hook must not be bypassed');
+    assert_true(!Cron_Event_Filter::should_bypass('wp_update_plugins'), 'Managed plugin update hook must not be bypassed');
+    assert_true(!Cron_Event_Filter::should_bypass('wp_update_themes'), 'Managed theme update hook must not be bypassed');
+    assert_true(Cron_Event_Filter::should_bypass('action_scheduler_run_queue'), 'Unmanaged default bypass hooks must remain active');
+    putenv('QUEUE_WORKER_MANAGED_CRON_HOOKS');
 
     Cron_Interceptor::register();
     assert_same([], $GLOBALS['test_actions'], 'Cron interceptor must register schedule_event as a filter, not an action');
