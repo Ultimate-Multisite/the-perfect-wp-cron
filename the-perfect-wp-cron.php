@@ -3,7 +3,7 @@
  * Plugin Name: The Perfect WP Cron
  * Plugin URI: https://github.com/Ultimate-Multisite/the-perfect-wp-cron
  * Description: Event-loop job queue for WordPress. Executes WP Cron and Action Scheduler jobs at exact scheduled times with zero polling using Workerman.
- * Version: 1.0.0
+ * Version: 1.0.2
  * Author: David Stone
  * Author URI: https://ultimatemultisite.com
  * License: GPL-2.0-or-later
@@ -11,6 +11,10 @@
  * Requires PHP: 8.1
  * Network: true
  */
+
+if ( ! defined( 'THE_PERFECT_WP_CRON_VERSION' ) ) {
+	define( 'THE_PERFECT_WP_CRON_VERSION', '1.0.2' );
+}
 
 if (!defined('ABSPATH')) {
     return;
