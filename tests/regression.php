@@ -239,6 +239,9 @@ namespace {
         public array $query_results = [];
         public array $cron_site_locks = [];
         public array $expired_cron_site_locks = [];
+        public bool $job_lock_table_exists = false;
+        public bool $job_lock_has_claimed_at_index = false;
+        public int $job_lock_index_add_queries = 0;
 
         public function prepare(string $query, ...$args): string
         {
@@ -252,6 +255,9 @@ namespace {
 
         public function get_var(string $query): ?string
         {
+            if (str_contains($query, 'SHOW INDEX FROM `wp_qw_job_locks`') && str_contains($query, "Key_name = 'claimed_at'")) {
+                return $this->job_lock_has_claimed_at_index ? 'claimed_at' : null;
+            }
             if (preg_match('/SELECT owner_token FROM `wp_qw_cron_site_locks` WHERE site_id = ([0-9]+)/', $query, $matches)) {
                 return $this->cron_site_locks[(int) $matches[1]] ?? null;
             }
@@ -273,6 +279,21 @@ namespace {
         public function query(string $query)
         {
             $this->queries[] = $query;
+
+            if (str_contains($query, 'qw_job_locks')) {
+                if (str_starts_with($query, 'CREATE TABLE')) {
+                    if (!$this->job_lock_table_exists) {
+                        $this->job_lock_table_exists = true;
+                        $this->job_lock_has_claimed_at_index = str_contains($query, 'KEY claimed_at (claimed_at)');
+                    }
+                    return 1;
+                }
+                if (str_starts_with($query, 'ALTER TABLE')) {
+                    $this->job_lock_has_claimed_at_index = true;
+                    $this->job_lock_index_add_queries++;
+                    return 1;
+                }
+            }
 
             if (str_contains($query, 'qw_cron_site_locks')) {
                 if (str_starts_with($query, 'CREATE TABLE')) {
@@ -623,6 +644,18 @@ namespace {
     );
 
     Worker_Process::ensure_lock_table();
+    assert_true(
+        str_contains(implode("\n", $GLOBALS['wpdb']->queries), 'KEY claimed_at (claimed_at)'),
+        'New job lock tables must index claimed_at for stale-lock cleanup'
+    );
+    assert_same(true, $GLOBALS['wpdb']->job_lock_has_claimed_at_index, 'New job lock tables must create the claimed_at index');
+    assert_same(0, $GLOBALS['wpdb']->job_lock_index_add_queries, 'New job lock tables must not need a follow-up index migration');
+    $GLOBALS['wpdb']->job_lock_has_claimed_at_index = false;
+    Worker_Process::ensure_lock_table();
+    assert_same(true, $GLOBALS['wpdb']->job_lock_has_claimed_at_index, 'Existing job lock tables must receive the claimed_at index');
+    assert_same(1, $GLOBALS['wpdb']->job_lock_index_add_queries, 'Existing job lock tables must add the claimed_at index once');
+    Worker_Process::ensure_lock_table();
+    assert_same(1, $GLOBALS['wpdb']->job_lock_index_add_queries, 'Job lock index migration must be idempotent');
     assert_true(
         str_contains(implode("\n", $GLOBALS['wpdb']->queries), 'CREATE TABLE IF NOT EXISTS `wp_qw_cron_site_locks`'),
         'Worker startup must provision the shared per-site cron lock table'

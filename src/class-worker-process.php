@@ -1908,9 +1908,18 @@ class Worker_Process
 
         $wpdb->query("CREATE TABLE IF NOT EXISTS `$table` (
             lock_key VARCHAR(64) NOT NULL PRIMARY KEY,
-            claimed_at DATETIME NOT NULL
+            claimed_at DATETIME NOT NULL,
+            KEY claimed_at (claimed_at)
         ) ENGINE=InnoDB"
         );
+
+        $claimed_at_index = $wpdb->get_var($wpdb->prepare(
+            "SHOW INDEX FROM `$table` WHERE Key_name = %s",
+            'claimed_at'
+        ));
+        if ($claimed_at_index === null) {
+            $wpdb->query("ALTER TABLE `$table` ADD INDEX claimed_at (claimed_at)");
+        }
 
         $cron_site_locks = $wpdb->base_prefix . 'qw_cron_site_locks';
         $wpdb->query("CREATE TABLE IF NOT EXISTS `$cron_site_locks` (
