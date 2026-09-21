@@ -288,6 +288,13 @@ class Job_Executor
 
         $runner = \ActionScheduler_QueueRunner::instance();
         $runner->process_action($action_id);
+
+        // Action Scheduler catches callback exceptions itself and persists a
+        // failed status. A normal return therefore does not imply success.
+        // Keep the detailed exception in AS's own log, not the worker output.
+        if (\ActionScheduler::store()->get_status($action_id) === \ActionScheduler_Store::STATUS_FAILED) {
+            throw new \RuntimeException('Action Scheduler marked the action failed; inspect its action log');
+        }
     }
 
     /**
