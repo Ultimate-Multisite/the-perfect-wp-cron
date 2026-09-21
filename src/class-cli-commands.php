@@ -46,6 +46,10 @@ class CLI_Commands
         WP_CLI::log(sprintf('  Running AS:     %d', $data['running_as_jobs'] ?? 0));
         WP_CLI::log(sprintf('  Memory:         %s', $data['memory'] ?? 'unknown'));
 
+        if (!empty($data['draining'])) {
+            WP_CLI::log(sprintf('  Draining:       %s; waiting for active subprocesses before recycling', $data['drain_reason'] ?? 'requested'));
+        }
+
         if (!empty($data['rescan']) && is_array($data['rescan'])) {
             WP_CLI::log(sprintf(
                 '  Rescan:         %s (last duration: %ds)',

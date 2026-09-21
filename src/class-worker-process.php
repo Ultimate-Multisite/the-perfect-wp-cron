@@ -73,6 +73,9 @@ class Worker_Process
     private int $last_rescan_duration = 0;
     private bool $is_ready = false;
     private string $failure_reason = '';
+    private bool $is_draining = false;
+    private bool $recycle_requested = false;
+    private string $drain_reason = '';
     /** @var array<int, true> */
     private array $unroutable_sites_logged = [];
 
@@ -195,6 +198,11 @@ class Worker_Process
             return;
         }
 
+        if ($this->is_draining) {
+            $connection->close(json_encode(['accepted' => false, 'reason' => 'worker_draining']) . "\n");
+            return;
+        }
+
         if (!$this->is_ready) {
             Worker::log('[SOCKET] Dropping job because the worker is unavailable: ' . $this->failure_reason);
             $connection->close(json_encode([
@@ -262,6 +270,9 @@ class Worker_Process
      */
     private function schedule_timer(Job_Payload $payload): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         if ($payload->site_url === '') {
             if (!isset($this->unroutable_sites_logged[$payload->site_id])) {
                 Worker::log(sprintf(
@@ -299,6 +310,10 @@ class Worker_Process
         unset($this->pending_timers[$key]);
         unset($this->pending_timer_payloads[$key]);
 
+        if ($this->is_draining) {
+            return;
+        }
+
         if ($payload->source === 'action_scheduler') {
             $this->execute_action_scheduler_job($payload);
             return;
@@ -334,6 +349,9 @@ class Worker_Process
      */
     private function execute_action_scheduler_job(Job_Payload $payload): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         $key = $payload->tracking_key();
 
         $lane = $this->action_scheduler_lane_for($payload);
@@ -429,6 +447,9 @@ class Worker_Process
      */
     private function flush_batches(): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         $this->flush_action_scheduler_batches();
 
         foreach ($this->ordered_cron_lanes() as $lane) {
@@ -859,6 +880,7 @@ class Worker_Process
         }
         // Re-index to prevent gaps
         $this->running_processes = array_values($this->running_processes);
+        $this->finish_draining();
     }
 
     /**
@@ -960,6 +982,9 @@ class Worker_Process
 
     private function run_full_rescan(int $worker_id): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         if ($this->is_rescanning) {
             Worker::log(sprintf('[W%d][RESCAN] Previous full-network rescan still running; skipping overlap.', $worker_id));
             return;
@@ -1448,6 +1473,9 @@ class Worker_Process
 
     private function rescan_action_scheduler_jobs(): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         if (!function_exists('as_get_scheduled_actions')) {
             return;
         }
@@ -1662,6 +1690,8 @@ class Worker_Process
                     'memory'          => sprintf('%.1f MB', $mem_mb),
                     'ready'           => $this->is_ready,
                     'failure_reason'  => $this->failure_reason,
+                    'draining'        => $this->is_draining,
+                    'drain_reason'    => $this->drain_reason,
                     'running_details' => $running_details,
                     'rescan'          => [
                         'in_progress' => $this->is_rescanning,
@@ -1675,9 +1705,9 @@ class Worker_Process
                 break;
 
             case 'restart':
-                Worker::log('[COMMAND] Restart requested.');
+                Worker::log('[COMMAND] Drain and recycle requested.');
                 $connection->close();
-                Worker::stopAll();
+                $this->begin_draining('operator request');
                 break;
 
             default:
@@ -1884,18 +1914,57 @@ class Worker_Process
      */
     private function check_limits(int $worker_id): void
     {
+        if ($this->is_draining) {
+            $this->finish_draining();
+            return;
+        }
         $mem_mb = memory_get_usage(true) / 1024 / 1024;
         $uptime = time() - $this->start_time;
 
         if ($mem_mb > $this->memory_limit) {
-            Worker::log(sprintf('[W%d][WATCHDOG] Memory %.1fMB > %dMB limit. Restarting.', $worker_id, $mem_mb, $this->memory_limit));
-            Worker::stopAll();
+            $this->begin_draining(sprintf('W%d memory %.1fMB > %dMB', $worker_id, $mem_mb, $this->memory_limit));
+            return;
         }
 
         if ($uptime > $this->uptime_limit) {
-            Worker::log(sprintf('[W%d][WATCHDOG] Uptime %ds > %ds limit. Restarting.', $worker_id, $uptime, $this->uptime_limit));
-            Worker::stopAll();
+            $this->begin_draining(sprintf('W%d uptime %ds > %ds', $worker_id, $uptime, $this->uptime_limit));
         }
+    }
+
+    private function begin_draining(string $reason): void
+    {
+        if ($this->is_draining) {
+            return;
+        }
+        $this->is_draining = true;
+        $this->drain_reason = $reason;
+        Worker::log('[WATCHDOG][DRAIN] ' . $reason . '; waiting for active subprocesses');
+
+        foreach ($this->pending_timers as $timer_id) {
+            Timer::del($timer_id);
+        }
+        $this->pending_timers = [];
+        $this->pending_timer_payloads = [];
+        // These jobs remain in the durable cron/AS store. Do not delete their
+        // ownerless claim keys: another worker may already have renewed them.
+        // The replacement scan rediscovers them after the five-minute lease.
+        $this->pending_batch = [];
+        $this->pending_as_batch = [];
+        $this->finish_draining();
+    }
+
+    private function finish_draining(): void
+    {
+        if (!$this->is_draining || $this->recycle_requested
+            || $this->running_processes !== [] || $this->active_scan_process !== null) {
+            return;
+        }
+        // Keep polling and refreshing leases until active children finish (or
+        // reach their existing per-job/batch/scan timeout). Never abandon an
+        // executing callback just because the event-loop child is one hour old.
+        $this->recycle_requested = true;
+        Worker::log('[WATCHDOG][RECYCLE] Active subprocesses drained; recycling child');
+        Worker::stopAll();
     }
 
     /**
