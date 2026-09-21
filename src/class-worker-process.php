@@ -73,6 +73,10 @@ class Worker_Process
     private int $last_rescan_duration = 0;
     private bool $is_ready = false;
     private string $failure_reason = '';
+    private bool $is_draining = false;
+    private bool $recycle_requested = false;
+    private string $drain_reason = '';
+    private int $worker_id = 0;
     /** @var array<int, true> */
     private array $unroutable_sites_logged = [];
 
@@ -110,6 +114,7 @@ class Worker_Process
     {
         $this->start_time = time();
         $worker_id = $w->id;
+        $this->worker_id = $worker_id;
         $socket_path = Config::socket_path();
 
         if ($worker_id === 0 && file_exists($socket_path)) {
@@ -177,9 +182,11 @@ class Worker_Process
 
         // Memory and uptime watchdog
         Timer::add(30, function () use ($worker_id) {
+            $this->notify_supervisor();
             $this->check_limits($worker_id);
         });
         $this->is_ready = true;
+        $this->notify_supervisor();
     }
 
     /**
@@ -192,6 +199,11 @@ class Worker_Process
         $decoded = json_decode($data, true);
         if (is_array($decoded) && isset($decoded['command'])) {
             $this->handle_command($connection, $decoded);
+            return;
+        }
+
+        if ($this->is_draining) {
+            $connection->close(json_encode(['accepted' => false, 'reason' => 'worker_draining']) . "\n");
             return;
         }
 
@@ -222,7 +234,30 @@ class Worker_Process
      */
     public function on_worker_stop(): void
     {
-        $this->terminate_active_scan();
+        // Workerman's graceful SIGQUIT/SIGUSR2 waits for this callback. The
+        // host must use KillMode=mixed so job subprocesses do not also receive
+        // the signal, and allow at least the configured batch timeout to stop.
+        // Mark exit requested first to avoid recursive stopAll() while polling.
+        $this->recycle_requested = true;
+        $this->begin_draining('supervisor stop/reload');
+        $last_heartbeat = 0;
+        while ($this->running_processes !== [] || $this->active_scan_process !== null) {
+            $this->poll_processes($this->worker_id);
+            if (time() - $last_heartbeat >= 15) {
+                $this->notify_supervisor();
+                $last_heartbeat = time();
+            }
+            usleep(100000);
+        }
+    }
+
+    private function notify_supervisor(): void
+    {
+        // The scan coordinator must remain responsive. Other pool children
+        // must not hide a wedged coordinator by sending their own heartbeat.
+        if ($this->worker_id === 0 && $this->is_ready && !Systemd_Notifier::heartbeat()) {
+            Worker::log('[WATCHDOG] Could not notify systemd coordinator liveness');
+        }
     }
 
     // ------------------------------------------------------------------
@@ -262,6 +297,9 @@ class Worker_Process
      */
     private function schedule_timer(Job_Payload $payload): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         if ($payload->site_url === '') {
             if (!isset($this->unroutable_sites_logged[$payload->site_id])) {
                 Worker::log(sprintf(
@@ -299,6 +337,10 @@ class Worker_Process
         unset($this->pending_timers[$key]);
         unset($this->pending_timer_payloads[$key]);
 
+        if ($this->is_draining) {
+            return;
+        }
+
         if ($payload->source === 'action_scheduler') {
             $this->execute_action_scheduler_job($payload);
             return;
@@ -334,6 +376,9 @@ class Worker_Process
      */
     private function execute_action_scheduler_job(Job_Payload $payload): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         $key = $payload->tracking_key();
 
         $lane = $this->action_scheduler_lane_for($payload);
@@ -367,9 +412,9 @@ class Worker_Process
             $payloads
         );
         $json_data = json_encode($json_array);
-        $cmd = sprintf('php %s --stdin', escapeshellarg($this->execute_script));
-
-        $process = proc_open($cmd, [
+        // No shell wrapper: termination/reaping must address the actual PHP
+        // executor, not leave its child running after a shell is killed.
+        $process = proc_open([PHP_BINARY, $this->execute_script, '--stdin'], [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
             2 => ['pipe', 'w'],
@@ -429,6 +474,9 @@ class Worker_Process
      */
     private function flush_batches(): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         $this->flush_action_scheduler_batches();
 
         foreach ($this->ordered_cron_lanes() as $lane) {
@@ -859,6 +907,7 @@ class Worker_Process
         }
         // Re-index to prevent gaps
         $this->running_processes = array_values($this->running_processes);
+        $this->finish_draining();
     }
 
     /**
@@ -960,6 +1009,9 @@ class Worker_Process
 
     private function run_full_rescan(int $worker_id): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         if ($this->is_rescanning) {
             Worker::log(sprintf('[W%d][RESCAN] Previous full-network rescan still running; skipping overlap.', $worker_id));
             return;
@@ -1448,6 +1500,9 @@ class Worker_Process
 
     private function rescan_action_scheduler_jobs(): void
     {
+        if ($this->is_draining) {
+            return;
+        }
         if (!function_exists('as_get_scheduled_actions')) {
             return;
         }
@@ -1662,6 +1717,8 @@ class Worker_Process
                     'memory'          => sprintf('%.1f MB', $mem_mb),
                     'ready'           => $this->is_ready,
                     'failure_reason'  => $this->failure_reason,
+                    'draining'        => $this->is_draining,
+                    'drain_reason'    => $this->drain_reason,
                     'running_details' => $running_details,
                     'rescan'          => [
                         'in_progress' => $this->is_rescanning,
@@ -1675,9 +1732,9 @@ class Worker_Process
                 break;
 
             case 'restart':
-                Worker::log('[COMMAND] Restart requested.');
+                Worker::log('[COMMAND] Drain and recycle requested.');
                 $connection->close();
-                Worker::stopAll();
+                $this->begin_draining('operator request');
                 break;
 
             default:
@@ -1884,18 +1941,57 @@ class Worker_Process
      */
     private function check_limits(int $worker_id): void
     {
+        if ($this->is_draining) {
+            $this->finish_draining();
+            return;
+        }
         $mem_mb = memory_get_usage(true) / 1024 / 1024;
         $uptime = time() - $this->start_time;
 
         if ($mem_mb > $this->memory_limit) {
-            Worker::log(sprintf('[W%d][WATCHDOG] Memory %.1fMB > %dMB limit. Restarting.', $worker_id, $mem_mb, $this->memory_limit));
-            Worker::stopAll();
+            $this->begin_draining(sprintf('W%d memory %.1fMB > %dMB', $worker_id, $mem_mb, $this->memory_limit));
+            return;
         }
 
         if ($uptime > $this->uptime_limit) {
-            Worker::log(sprintf('[W%d][WATCHDOG] Uptime %ds > %ds limit. Restarting.', $worker_id, $uptime, $this->uptime_limit));
-            Worker::stopAll();
+            $this->begin_draining(sprintf('W%d uptime %ds > %ds', $worker_id, $uptime, $this->uptime_limit));
         }
+    }
+
+    private function begin_draining(string $reason): void
+    {
+        if ($this->is_draining) {
+            return;
+        }
+        $this->is_draining = true;
+        $this->drain_reason = $reason;
+        Worker::log('[WATCHDOG][DRAIN] ' . $reason . '; waiting for active subprocesses');
+
+        foreach ($this->pending_timers as $timer_id) {
+            Timer::del($timer_id);
+        }
+        $this->pending_timers = [];
+        $this->pending_timer_payloads = [];
+        // These jobs remain in the durable cron/AS store. Do not delete their
+        // ownerless claim keys: another worker may already have renewed them.
+        // The replacement scan rediscovers them after the five-minute lease.
+        $this->pending_batch = [];
+        $this->pending_as_batch = [];
+        $this->finish_draining();
+    }
+
+    private function finish_draining(): void
+    {
+        if (!$this->is_draining || $this->recycle_requested
+            || $this->running_processes !== [] || $this->active_scan_process !== null) {
+            return;
+        }
+        // Keep polling and refreshing leases until active children finish (or
+        // reach their existing per-job/batch/scan timeout). Never abandon an
+        // executing callback just because the event-loop child is one hour old.
+        $this->recycle_requested = true;
+        Worker::log('[WATCHDOG][RECYCLE] Active subprocesses drained; recycling child');
+        Worker::stopAll();
     }
 
     /**

@@ -106,8 +106,8 @@ Every setting can be configured via PHP constant (in `wp-config.php`) or environ
 | `QUEUE_WORKER_SCAN_TIMEOUT` | `300` | Full-network scanner subprocess timeout in seconds |
 | `QUEUE_WORKER_BYPASS_CRON_HOOKS` | empty | Additional comma-separated WP-Cron hooks for the worker to ignore |
 | `QUEUE_WORKER_MANAGED_CRON_HOOKS` | empty | Comma-separated default-bypassed hooks that this worker should manage |
-| `QUEUE_WORKER_MEMORY_LIMIT` | `200` | Memory limit in MB before auto-restart |
-| `QUEUE_WORKER_UPTIME_LIMIT` | `3600` | Max uptime in seconds before auto-restart |
+| `QUEUE_WORKER_MEMORY_LIMIT` | `200` | Memory limit in MB before draining and recycling the event-loop child |
+| `QUEUE_WORKER_UPTIME_LIMIT` | `3600` | Uptime in seconds before draining and recycling the event-loop child |
 | `QUEUE_WORKER_LOG_FILE` | auto-detect | Path to log for admin viewer |
 | `QUEUE_WORKER_LOG_RETENTION` | `7` | Days to keep job log entries |
 | `DOMAIN_CURRENT_SITE` | `localhost` | Primary domain for WP bootstrap in worker |
@@ -158,6 +158,14 @@ WorkingDirectory=/var/www/example.com/current
 ExecStart=/usr/bin/php web/app/plugins/the-perfect-wp-cron/bin/worker.php start
 Restart=always
 RestartSec=5
+KillSignal=SIGQUIT
+KillMode=mixed
+ExecReload=/bin/kill -USR2 $MAINPID
+TimeoutStopSec=3700s
+TimeoutAbortSec=120s
+RuntimeMaxSec=infinity
+WatchdogSec=120s
+NotifyAccess=all
 StandardOutput=append:/var/log/the-perfect-wp-cron.log
 StandardError=append:/var/log/the-perfect-wp-cron-error.log
 MemoryMax=1G
@@ -178,8 +186,65 @@ sudo systemctl start the-perfect-wp-cron
 ```bash
 wp queue status      # Show worker PID, uptime, memory, pending/running jobs
 wp queue populate    # Rescan — send all pending jobs to the worker
-wp queue restart     # Graceful restart (systemd auto-restarts)
+wp queue restart     # Drain and recycle the contacted event-loop child
 ```
+
+### Bounded Action Scheduler housekeeping
+
+The bridge schedules `qw_cleanup_action_scheduler` every five minutes. It uses
+the native cleaner API for **one pass of at most 100 completed and 100 canceled
+actions** older than the effective `action_scheduler_retention_period` (31 days
+by default). It does not delete pending or failed actions, reset claims, or run
+another AS queue runner. Cleaner status filters may narrow the two terminal
+statuses but cannot expand them. A non-positive retention period fails closed.
+
+An independently scheduled `action_scheduler_run_actions_cleanup_hook` with a
+registered callback takes precedence. An orphaned event without a callback, or
+a callback with no event, does not suppress this fallback. `qw_cleanup_job_log`
+is separate maintenance for worker logs.
+
+Large existing AS tables will drain gradually; do not increase the batch size or
+bulk-delete historical records without reviewing database load and retention
+requirements. Before rollout, check the effective retention filters and terminal
+row counts in each target runtime. Verify a bounded decrease afterwards while
+pending and failed rows remain untouched. The PHP regression suite does not
+replace an isolated WordPress/AS integration canary before production rollout.
+
+### Draining and service lifetime
+
+Memory/uptime limits and `wp queue restart` stop accepting new work, cancel only
+in-memory timers, and wait for active job and scanner subprocesses. Polling and
+cron lease renewal continue. Existing per-job, batch, and scan timeouts still
+apply. Pending jobs remain in WordPress/AS and are rediscovered; already-claimed
+but unstarted jobs may wait for the existing five-minute claim lease and rescan.
+`wp queue status` remains available and displays the draining reason.
+
+Workerman respawns the drained child; its master PID need not change. With more
+than one child, `wp queue restart` affects only the child contacted by the socket,
+not the whole pool.
+
+**External stop/reload requires the matching service policy.** Use
+`KillSignal=SIGQUIT`, `KillMode=mixed`, and graceful `SIGUSR2` reloads as above.
+Workerman forwards the signal only to event-loop children, whose stop callbacks
+keep polling executors until completion or their existing timeout. Mixed kill
+mode prevents systemd from signaling every executor at once. Allow the batch
+timeout plus margin in `TimeoutStopSec` (3700s for the default 3600s batch limit).
+Hard OOM kills, ungraceful signals, or an exhausted stop budget cannot drain jobs.
+
+Systemd `RuntimeMaxSec` measures the master's absolute lifetime, not progress;
+child recycling never resets it. With PHP's **sockets extension** installed, the
+scan coordinator sends `WATCHDOG=1` every 30 seconds through `NOTIFY_SOCKET`.
+Use `WatchdogSec=120s` and `NotifyAccess=all` before disabling the absolute master
+deadline. Other children cannot mask a stalled coordinator with heartbeats.
+This measures coordinator liveness, not callback success or individual pool
+health: continue monitoring action outcomes, backlog age, and job/scan timeouts.
+Without `NOTIFY_SOCKET`, notification is a no-op. Do not enable the service
+watchdog on older plugin code or PHP without sockets support.
+
+The stop path is tested with a real Workerman 5.2.2 master receiving SIGQUIT
+during an active executor. The executor completes before the master exits.
+The cleaner and failure reporting were also exercised against isolated
+WordPress 7.1.1 and Action Scheduler 3.9.3 SQL tables.
 
 ### Admin Dashboard
 
@@ -254,7 +319,7 @@ The worker creates the socket with mode 0660. Ensure the web server user (`www-d
 Increase `QUEUE_WORKER_JOB_TIMEOUT` (default 300 seconds). For specific hooks that need more time, consider breaking the work into smaller chunks.
 
 **High memory usage / frequent restarts**
-The watchdog restarts workers when memory exceeds `QUEUE_WORKER_MEMORY_LIMIT` (default 200 MB) or uptime exceeds `QUEUE_WORKER_UPTIME_LIMIT` (default 3600 seconds). These are safety nets — increase them if your workload legitimately needs more resources, or investigate memory leaks in the jobs themselves.
+The watchdog drains and recycles event-loop children when memory exceeds `QUEUE_WORKER_MEMORY_LIMIT` (default 200 MB) or uptime exceeds `QUEUE_WORKER_UPTIME_LIMIT` (default 3600 seconds). Check the draining reason and active subprocesses before interpreting this as a failure. A regular systemd `RuntimeMaxSec` expiration is a separate absolute master-lifetime policy, not proof of a stuck loop.
 
 ## License
 

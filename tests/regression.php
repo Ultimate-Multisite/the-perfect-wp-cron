@@ -5,6 +5,7 @@ namespace Workerman {
     {
         public int $id = 0;
         public static array $logs = [];
+        public static int $stop_calls = 0;
 
         public static function log(string $message): void
         {
@@ -13,6 +14,7 @@ namespace Workerman {
 
         public static function stopAll(): void
         {
+            self::$stop_calls++;
         }
     }
 
@@ -20,6 +22,12 @@ namespace Workerman {
     {
         public static int $next_id = 1;
         public static array $delays = [];
+        public static array $deleted = [];
+
+        public static function del(int $id): void
+        {
+            self::$deleted[] = $id;
+        }
 
         public static function add($delay, callable $callback, array $args = [], bool $persistent = true): int
         {
@@ -147,6 +155,17 @@ namespace {
         public function process_action(int $action_id): void
         {
             $this->processed_action_ids[] = $action_id;
+        }
+    }
+
+    class ActionScheduler_QueueCleaner
+    {
+        public static array $calls = [];
+
+        public function clean_actions(array $statuses, DateTime $cutoff, int $batch_size): array
+        {
+            self::$calls[] = [$statuses, $cutoff->getTimestamp(), $batch_size];
+            return [];
         }
     }
 }
@@ -417,6 +436,38 @@ namespace {
         ];
     }
 
+    function remove_action(string $hook, $callback): void
+    {
+        $GLOBALS['test_removed_actions'][] = [$hook, $callback];
+    }
+
+    function has_action(string $hook)
+    {
+        return $GLOBALS['test_registered_hooks'][$hook] ?? false;
+    }
+
+    function wp_next_scheduled(string $hook)
+    {
+        return $GLOBALS['test_scheduled_hooks'][$hook] ?? false;
+    }
+
+    function wp_schedule_event(int $timestamp, string $schedule, string $hook): bool
+    {
+        $GLOBALS['test_scheduled_hooks'][$hook] = $timestamp;
+        $GLOBALS['test_created_events'][] = [$timestamp, $schedule, $hook];
+        return true;
+    }
+
+    function apply_filters(string $hook, $value)
+    {
+        return $GLOBALS['test_filter_values'][$hook] ?? $value;
+    }
+
+    function as_get_datetime_object($timestamp): DateTime
+    {
+        return (new DateTime())->setTimestamp((int) $timestamp);
+    }
+
     function _get_cron_array(): array
     {
         return $GLOBALS['test_crons'];
@@ -532,6 +583,138 @@ namespace {
     require_once __DIR__ . '/../src/class-job-executor.php';
     require_once __DIR__ . '/../src/class-socket-client.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
+    require_once __DIR__ . '/../src/class-action-scheduler-bridge.php';
+    require_once __DIR__ . '/../src/class-systemd-notifier.php';
+
+    $original_notify_socket = getenv('NOTIFY_SOCKET');
+    putenv('NOTIFY_SOCKET');
+    assert_true(QueueWorker\Systemd_Notifier::heartbeat(), 'Non-systemd environments must remain supported');
+    putenv('NOTIFY_SOCKET=relative-invalid-socket');
+    assert_same(false, QueueWorker\Systemd_Notifier::heartbeat(), 'Invalid notification addresses must fail closed');
+    if (function_exists('socket_create') && PHP_OS_FAMILY === 'Linux') {
+        $notify_name = 'qw-regression-' . getmypid() . '-' . bin2hex(random_bytes(4));
+        $notify_server = socket_create(AF_UNIX, SOCK_DGRAM, 0);
+        assert_true($notify_server !== false && socket_bind($notify_server, "\0" . $notify_name), 'Notification fixture must bind its own abstract socket');
+        try {
+            socket_set_option($notify_server, SOL_SOCKET, SO_RCVTIMEO, ['sec' => 1, 'usec' => 0]);
+            putenv('NOTIFY_SOCKET=@' . $notify_name);
+            assert_true(QueueWorker\Systemd_Notifier::heartbeat(), 'Heartbeat must reach an abstract systemd-style socket');
+            socket_recv($notify_server, $notification, 128, 0);
+            assert_same('WATCHDOG=1', $notification, 'Only fixed liveness data may be sent');
+        } finally {
+            socket_close($notify_server);
+        }
+    }
+    $original_notify_socket === false ? putenv('NOTIFY_SOCKET') : putenv('NOTIFY_SOCKET=' . $original_notify_socket);
+
+    $GLOBALS['test_scheduled_hooks'] = [];
+    $GLOBALS['test_created_events'] = [];
+    QueueWorker\Action_Scheduler_Bridge::register();
+    QueueWorker\Action_Scheduler_Bridge::register();
+    assert_same(1, count($GLOBALS['test_created_events']), 'Maintenance registration must not duplicate scheduled cleanup');
+    $cleanup_hook = QueueWorker\Action_Scheduler_Bridge::CLEANUP_HOOK;
+    assert_same($cleanup_hook, $GLOBALS['test_created_events'][0][2], 'Cleanup must have its own worker-managed hook');
+    assert_same(false, Cron_Event_Filter::should_bypass($cleanup_hook), 'Maintenance must not use a bypassed AS runner hook');
+    assert_same(300, QueueWorker\Action_Scheduler_Bridge::cleanup_schedule([])['qw_every_five_minutes']['interval'], 'Maintenance cadence must be bounded');
+    $cleanup_now = time();
+    QueueWorker\Action_Scheduler_Bridge::cleanup();
+    assert_same(['complete', 'canceled'], ActionScheduler_QueueCleaner::$calls[0][0], 'Cleanup must only target terminal nonfailed statuses');
+    assert_same(100, ActionScheduler_QueueCleaner::$calls[0][2], 'Cleanup must cap each status batch');
+    assert_true(abs(ActionScheduler_QueueCleaner::$calls[0][1] - ($cleanup_now - 2678400)) <= 1, 'Cleanup must retain 31 days by default');
+    $GLOBALS['test_filter_values']['action_scheduler_retention_period'] = 86400 * 60;
+    $GLOBALS['test_filter_values']['action_scheduler_default_cleaner_statuses'] = ['complete', 'failed', 'pending'];
+    QueueWorker\Action_Scheduler_Bridge::cleanup();
+    assert_same(['complete'], ActionScheduler_QueueCleaner::$calls[1][0], 'Filters must not expand cleanup into pending or failed jobs');
+    assert_true(abs(ActionScheduler_QueueCleaner::$calls[1][1] - (time() - 86400 * 60)) <= 1, 'Custom retention must be respected');
+    $GLOBALS['test_filter_values']['action_scheduler_retention_period'] = 0;
+    $invalid_retention_rejected = false;
+    try {
+        QueueWorker\Action_Scheduler_Bridge::cleanup();
+    } catch (RuntimeException $e) {
+        $invalid_retention_rejected = true;
+    }
+    assert_true($invalid_retention_rejected, 'Invalid retention must fail closed');
+    assert_same(2, count(ActionScheduler_QueueCleaner::$calls), 'Invalid retention must not invoke the cleaner');
+    $GLOBALS['test_filter_values'] = [];
+    $GLOBALS['test_registered_hooks']['action_scheduler_run_actions_cleanup_hook'] = 10;
+    $GLOBALS['test_scheduled_hooks']['action_scheduler_run_actions_cleanup_hook'] = time() + 60;
+    QueueWorker\Action_Scheduler_Bridge::cleanup();
+    assert_same(2, count(ActionScheduler_QueueCleaner::$calls), 'An independent native cleaner must not be duplicated');
+    $GLOBALS['test_scheduled_hooks'] = [];
+    QueueWorker\Action_Scheduler_Bridge::cleanup();
+    assert_same(3, count(ActionScheduler_QueueCleaner::$calls), 'A registered but unscheduled native hook must not suppress maintenance');
+    $GLOBALS['test_registered_hooks'] = [];
+    $GLOBALS['test_actions'] = [];
+    $GLOBALS['test_filters'] = [];
+
+    $draining_worker = new Worker_Process('/unused/wp-load.php', 'example.test', '/unused/execute-job.php');
+    set_private_property($draining_worker, 'is_ready', true);
+    set_private_property($draining_worker, 'start_time', time() - 7200);
+    set_private_property($draining_worker, 'running_processes', [['payloads' => []]]);
+    set_private_property($draining_worker, 'pending_timers', ['deferred' => 987]);
+    invoke_private($draining_worker, 'check_limits', [0]);
+    assert_true(private_property($draining_worker, 'is_draining'), 'Uptime limit must enter draining state');
+    assert_same(0, \Workerman\Worker::$stop_calls, 'Recycling must not stop an active job subprocess');
+    assert_true(in_array(987, \Workerman\Timer::$deleted, true), 'Draining must cancel future in-memory timers');
+    $drain_connection = new Test_Connection();
+    $draining_worker->on_message($drain_connection, '{"hook":"new_job"}');
+    assert_same(false, json_decode($drain_connection->response, true)['accepted'], 'Draining must reject new socket work for later rescan');
+    invoke_private($draining_worker, 'flush_batches');
+    invoke_private($draining_worker, 'run_full_rescan', [0]);
+    invoke_private($draining_worker, 'rescan_action_scheduler_jobs');
+    assert_same(0, \Workerman\Worker::$stop_calls, 'Drain must keep event-loop polling without starting new work');
+    set_private_property($draining_worker, 'running_processes', []);
+    set_private_property($draining_worker, 'active_scan_process', ['pending' => true]);
+    invoke_private($draining_worker, 'finish_draining');
+    assert_same(0, \Workerman\Worker::$stop_calls, 'Recycle must also wait for the active scanner');
+    set_private_property($draining_worker, 'active_scan_process', null);
+    invoke_private($draining_worker, 'finish_draining');
+    invoke_private($draining_worker, 'finish_draining');
+    assert_same(1, \Workerman\Worker::$stop_calls, 'Fully drained child must stop exactly once');
+    $drain_status_connection = new Test_Connection();
+    $draining_worker->on_message($drain_status_connection, '{"command":"status"}');
+    assert_same(true, json_decode($drain_status_connection->response, true)['draining'], 'Draining must remain inspectable via status');
+
+    // Exercise real subprocess polling: the child cannot finish until this
+    // fixture releases stdin, so this proves recycle does not kill it early.
+    $live_process = proc_open([PHP_BINARY, '-r', 'fgets(STDIN); fwrite(STDOUT, "done");'], [
+        0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'],
+    ], $live_pipes);
+    assert_true(is_resource($live_process), 'Drain fixture must start an owned subprocess');
+    try {
+        stream_set_blocking($live_pipes[1], false);
+        stream_set_blocking($live_pipes[2], false);
+        $live_worker = new Worker_Process('/unused/wp-load.php', 'example.test', '/unused/execute-job.php');
+        set_private_property($live_worker, 'running_jobs', 1);
+        set_private_property($live_worker, 'running_processes', [[
+            'process' => $live_process, 'pipes' => $live_pipes,
+            'payloads' => [new Job_Payload(['site_id' => 1, 'site_url' => 'https://example.test', 'hook' => 'drain_fixture'])],
+            'started' => time(), 'stdout' => '', 'stderr' => '', 'lane' => 'wp_cron',
+            'cron_site_lock_owner' => '', 'cron_site_lock_refreshed' => time(),
+        ]]);
+        $live_worker->on_message(new Test_Connection(), '{"command":"restart"}');
+        invoke_private($live_worker, 'poll_processes', [0]);
+        assert_true(proc_get_status($live_process)['running'], 'Restart must leave the in-flight subprocess alive');
+        assert_same(1, \Workerman\Worker::$stop_calls, 'Restart must defer stopping until the real subprocess completes');
+        fclose($live_pipes[0]);
+        $poll_deadline = microtime(true) + 3;
+        while (private_property($live_worker, 'running_processes') !== [] && microtime(true) < $poll_deadline) {
+            usleep(10000);
+            invoke_private($live_worker, 'poll_processes', [0]);
+        }
+        assert_same([], private_property($live_worker, 'running_processes'), 'Polling must reap the completed subprocess before recycling');
+        assert_same(2, \Workerman\Worker::$stop_calls, 'A drained operator restart must recycle exactly once');
+    } finally {
+        foreach ($live_pipes as $pipe) {
+            if (is_resource($pipe)) {
+                fclose($pipe);
+            }
+        }
+        if (is_resource($live_process)) {
+            proc_terminate($live_process);
+            proc_close($live_process);
+        }
+    }
 
     $payload = new Job_Payload([
         'site_id'   => 7,
