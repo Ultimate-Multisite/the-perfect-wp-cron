@@ -158,6 +158,14 @@ WorkingDirectory=/var/www/example.com/current
 ExecStart=/usr/bin/php web/app/plugins/the-perfect-wp-cron/bin/worker.php start
 Restart=always
 RestartSec=5
+KillSignal=SIGQUIT
+KillMode=mixed
+ExecReload=/bin/kill -USR2 $MAINPID
+TimeoutStopSec=3700s
+TimeoutAbortSec=120s
+RuntimeMaxSec=infinity
+WatchdogSec=120s
+NotifyAccess=all
 StandardOutput=append:/var/log/the-perfect-wp-cron.log
 StandardError=append:/var/log/the-perfect-wp-cron-error.log
 MemoryMax=1G
@@ -215,14 +223,28 @@ Workerman respawns the drained child; its master PID need not change. With more
 than one child, `wp queue restart` affects only the child contacted by the socket,
 not the whole pool.
 
-**An external service stop is different.** Systemd `RuntimeMaxSec` measures the
-master's absolute lifetime, not progress. A two-hour limit still expires even
-if children recycle normally. The drain protection above does not intercept
-systemd termination, hard OOM kills, or Workerman's external stop/reload signals.
-Do not describe those deadlines as a hung-worker detector. A deployment must
-separately choose and test its service-stop budget and liveness monitoring before
-removing or extending a hard master deadline; this plugin does not silently alter
-the host's systemd policy.
+**External stop/reload requires the matching service policy.** Use
+`KillSignal=SIGQUIT`, `KillMode=mixed`, and graceful `SIGUSR2` reloads as above.
+Workerman forwards the signal only to event-loop children, whose stop callbacks
+keep polling executors until completion or their existing timeout. Mixed kill
+mode prevents systemd from signaling every executor at once. Allow the batch
+timeout plus margin in `TimeoutStopSec` (3700s for the default 3600s batch limit).
+Hard OOM kills, ungraceful signals, or an exhausted stop budget cannot drain jobs.
+
+Systemd `RuntimeMaxSec` measures the master's absolute lifetime, not progress;
+child recycling never resets it. With PHP's **sockets extension** installed, the
+scan coordinator sends `WATCHDOG=1` every 30 seconds through `NOTIFY_SOCKET`.
+Use `WatchdogSec=120s` and `NotifyAccess=all` before disabling the absolute master
+deadline. Other children cannot mask a stalled coordinator with heartbeats.
+This measures coordinator liveness, not callback success or individual pool
+health: continue monitoring action outcomes, backlog age, and job/scan timeouts.
+Without `NOTIFY_SOCKET`, notification is a no-op. Do not enable the service
+watchdog on older plugin code or PHP without sockets support.
+
+The stop path is tested with a real Workerman 5.2.2 master receiving SIGQUIT
+during an active executor. The executor completes before the master exits.
+The cleaner and failure reporting were also exercised against isolated
+WordPress 7.1.1 and Action Scheduler 3.9.3 SQL tables.
 
 ### Admin Dashboard
 

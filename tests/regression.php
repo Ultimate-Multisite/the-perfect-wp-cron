@@ -584,6 +584,28 @@ namespace {
     require_once __DIR__ . '/../src/class-socket-client.php';
     require_once __DIR__ . '/../src/class-worker-process.php';
     require_once __DIR__ . '/../src/class-action-scheduler-bridge.php';
+    require_once __DIR__ . '/../src/class-systemd-notifier.php';
+
+    $original_notify_socket = getenv('NOTIFY_SOCKET');
+    putenv('NOTIFY_SOCKET');
+    assert_true(QueueWorker\Systemd_Notifier::heartbeat(), 'Non-systemd environments must remain supported');
+    putenv('NOTIFY_SOCKET=relative-invalid-socket');
+    assert_same(false, QueueWorker\Systemd_Notifier::heartbeat(), 'Invalid notification addresses must fail closed');
+    if (function_exists('socket_create') && PHP_OS_FAMILY === 'Linux') {
+        $notify_name = 'qw-regression-' . getmypid() . '-' . bin2hex(random_bytes(4));
+        $notify_server = socket_create(AF_UNIX, SOCK_DGRAM, 0);
+        assert_true($notify_server !== false && socket_bind($notify_server, "\0" . $notify_name), 'Notification fixture must bind its own abstract socket');
+        try {
+            socket_set_option($notify_server, SOL_SOCKET, SO_RCVTIMEO, ['sec' => 1, 'usec' => 0]);
+            putenv('NOTIFY_SOCKET=@' . $notify_name);
+            assert_true(QueueWorker\Systemd_Notifier::heartbeat(), 'Heartbeat must reach an abstract systemd-style socket');
+            socket_recv($notify_server, $notification, 128, 0);
+            assert_same('WATCHDOG=1', $notification, 'Only fixed liveness data may be sent');
+        } finally {
+            socket_close($notify_server);
+        }
+    }
+    $original_notify_socket === false ? putenv('NOTIFY_SOCKET') : putenv('NOTIFY_SOCKET=' . $original_notify_socket);
 
     $GLOBALS['test_scheduled_hooks'] = [];
     $GLOBALS['test_created_events'] = [];

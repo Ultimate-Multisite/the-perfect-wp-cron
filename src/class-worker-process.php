@@ -76,6 +76,7 @@ class Worker_Process
     private bool $is_draining = false;
     private bool $recycle_requested = false;
     private string $drain_reason = '';
+    private int $worker_id = 0;
     /** @var array<int, true> */
     private array $unroutable_sites_logged = [];
 
@@ -113,6 +114,7 @@ class Worker_Process
     {
         $this->start_time = time();
         $worker_id = $w->id;
+        $this->worker_id = $worker_id;
         $socket_path = Config::socket_path();
 
         if ($worker_id === 0 && file_exists($socket_path)) {
@@ -180,9 +182,11 @@ class Worker_Process
 
         // Memory and uptime watchdog
         Timer::add(30, function () use ($worker_id) {
+            $this->notify_supervisor();
             $this->check_limits($worker_id);
         });
         $this->is_ready = true;
+        $this->notify_supervisor();
     }
 
     /**
@@ -230,7 +234,30 @@ class Worker_Process
      */
     public function on_worker_stop(): void
     {
-        $this->terminate_active_scan();
+        // Workerman's graceful SIGQUIT/SIGUSR2 waits for this callback. The
+        // host must use KillMode=mixed so job subprocesses do not also receive
+        // the signal, and allow at least the configured batch timeout to stop.
+        // Mark exit requested first to avoid recursive stopAll() while polling.
+        $this->recycle_requested = true;
+        $this->begin_draining('supervisor stop/reload');
+        $last_heartbeat = 0;
+        while ($this->running_processes !== [] || $this->active_scan_process !== null) {
+            $this->poll_processes($this->worker_id);
+            if (time() - $last_heartbeat >= 15) {
+                $this->notify_supervisor();
+                $last_heartbeat = time();
+            }
+            usleep(100000);
+        }
+    }
+
+    private function notify_supervisor(): void
+    {
+        // The scan coordinator must remain responsive. Other pool children
+        // must not hide a wedged coordinator by sending their own heartbeat.
+        if ($this->worker_id === 0 && $this->is_ready && !Systemd_Notifier::heartbeat()) {
+            Worker::log('[WATCHDOG] Could not notify systemd coordinator liveness');
+        }
     }
 
     // ------------------------------------------------------------------
@@ -385,9 +412,9 @@ class Worker_Process
             $payloads
         );
         $json_data = json_encode($json_array);
-        $cmd = sprintf('php %s --stdin', escapeshellarg($this->execute_script));
-
-        $process = proc_open($cmd, [
+        // No shell wrapper: termination/reaping must address the actual PHP
+        // executor, not leave its child running after a shell is killed.
+        $process = proc_open([PHP_BINARY, $this->execute_script, '--stdin'], [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
             2 => ['pipe', 'w'],
