@@ -44,6 +44,13 @@ add_action('init', ['QueueWorker\\Cron_Interceptor', 'register']);
 QueueWorker\Action_Scheduler_Bridge::register_stored_action_hook();
 add_action('action_scheduler_init', ['QueueWorker\\Action_Scheduler_Bridge', 'register']);
 
+// Executors must load the cleanup callback even though they skip admin setup
+// and event creation below. Otherwise the worker consumes the cron event but
+// runs no callback and reports a successful no-op forever.
+add_action('qw_cleanup_job_log', function () {
+    QueueWorker\Job_Log::cleanup();
+});
+
 if ($job_executor_running) {
     return;
 }
@@ -65,11 +72,7 @@ register_activation_hook(__FILE__, function () {
     QueueWorker\Job_Log::ensure_table();
 });
 
-// Daily cleanup cron
-add_action('qw_cleanup_job_log', function () {
-    QueueWorker\Job_Log::cleanup();
-});
-
+// Daily cleanup cron creation belongs to ordinary request bootstraps.
 if (!wp_next_scheduled('qw_cleanup_job_log')) {
     wp_schedule_event(time(), 'daily', 'qw_cleanup_job_log');
 }

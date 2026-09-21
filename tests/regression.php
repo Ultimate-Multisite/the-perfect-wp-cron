@@ -102,6 +102,8 @@ namespace {
     class ActionScheduler_Store
     {
         public const STATUS_PENDING = 'pending';
+        public const STATUS_FAILED = 'failed';
+        public const STATUS_COMPLETE = 'complete';
     }
 
     class Test_ActionScheduler_Store
@@ -217,6 +219,13 @@ namespace {
 
     $plugin_entrypoint = file_get_contents(__DIR__ . '/../the-perfect-wp-cron.php');
     assert_true(is_string($plugin_entrypoint), 'Plugin entrypoint must be readable');
+    $cleanup_registration = strpos($plugin_entrypoint, "add_action('qw_cleanup_job_log'");
+    $executor_early_return = strpos($plugin_entrypoint, 'if ($job_executor_running)');
+    assert_true(
+        $cleanup_registration !== false && $executor_early_return !== false
+            && $cleanup_registration < $executor_early_return,
+        'Job executors must register the daily cleanup callback before skipping ordinary request setup'
+    );
     assert_true(
         str_contains($plugin_entrypoint, 'if ($queue_worker_running && !$job_executor_running)'),
         'Only non-executor worker processes may skip cron interceptor registration'
@@ -1103,10 +1112,24 @@ namespace {
     assert_same([44, 44, 44], ActionScheduler::$store->action_ids, 'Transaction visibility retries must check the same durable action ID');
 
     ActionScheduler::$store = new Test_ActionScheduler_Store();
-    ActionScheduler::$store->statuses = [ActionScheduler_Store::STATUS_PENDING];
+    ActionScheduler::$store->statuses = [ActionScheduler_Store::STATUS_PENDING, ActionScheduler_Store::STATUS_COMPLETE];
     ActionScheduler_QueueRunner::$runner = new ActionScheduler_QueueRunner();
     invoke_private($executor, 'execute_action_scheduler', [['action_id' => 45]]);
     assert_same([45], ActionScheduler_QueueRunner::$runner->processed_action_ids, 'A visible pending Action Scheduler action must run normally');
+
+    ActionScheduler::$store = new Test_ActionScheduler_Store();
+    ActionScheduler::$store->statuses = [ActionScheduler_Store::STATUS_PENDING, ActionScheduler_Store::STATUS_FAILED];
+    $as_failure = null;
+    try {
+        invoke_private($executor, 'execute_action_scheduler', [['action_id' => 47]]);
+    } catch (RuntimeException $e) {
+        $as_failure = $e->getMessage();
+    }
+    assert_same(
+        'Action Scheduler marked the action failed; inspect its action log',
+        $as_failure,
+        'A callback failure swallowed by the AS runner must reach the worker error log instead of being reported ok'
+    );
 
     ActionScheduler::$store = new Test_ActionScheduler_Store();
     ActionScheduler::$store->statuses = [
