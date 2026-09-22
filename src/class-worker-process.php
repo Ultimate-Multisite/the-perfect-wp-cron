@@ -1290,6 +1290,13 @@ class Worker_Process
             return [];
         }
 
+        try {
+            $excluded_networks = array_fill_keys(Config::excluded_isolated_network_ids(), true);
+        } catch (\Throwable $e) {
+            Worker::log('[RESCAN][ISOLATED][BLOCKED] Dedicated-network exclusion inventory is unavailable.');
+            return [];
+        }
+
         $path = WP_CONTENT_DIR . '/network-registry.data.json';
         if (!is_readable($path)) {
             return [];
@@ -1311,7 +1318,10 @@ class Worker_Process
             }
 
             $network_id = (int) ($entry['network_id'] ?? $entry['id'] ?? $registry_id);
-            if ($network_id < 1 || $this->site_url_from_registry_entry($entry) === '') {
+            if ($network_id < 1
+                || isset($excluded_networks[$network_id])
+                || $this->site_url_from_registry_entry($entry) === ''
+            ) {
                 continue;
             }
 

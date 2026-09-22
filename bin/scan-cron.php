@@ -331,6 +331,13 @@ function qw_scan_isolated_network_entries(): array
         return [];
     }
 
+    try {
+        $excluded_networks = array_fill_keys(Config::excluded_isolated_network_ids(), true);
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Dedicated-network exclusion inventory is unavailable; isolated scans are blocked.\n");
+        return [];
+    }
+
     $data = qw_scan_registry_data(WP_CONTENT_DIR . '/network-registry.data.json');
     if (empty($data['networks']) || !is_array($data['networks'])) {
         return [];
@@ -347,7 +354,7 @@ function qw_scan_isolated_network_entries(): array
         }
 
         $network_id = (int) ($entry['network_id'] ?? $entry['id'] ?? $registry_id);
-        if ($network_id > 0) {
+        if ($network_id > 0 && !isset($excluded_networks[$network_id])) {
             $entries[$network_id] = $entry;
         }
     }

@@ -169,6 +169,67 @@ class Config
         return max(1, (int) self::get('QUEUE_WORKER_AS_RESCAN_INTERVAL', 5));
     }
 
+    /**
+     * Isolated networks owned by dedicated workers must not also be scanned by
+     * the shared worker. The optional inventory file is re-read for every scan
+     * so newly provisioned runtimes do not require a shared-worker restart.
+     *
+     * The file may be a JSON array of network IDs or an object containing a
+     * "networks" object keyed by network ID.
+     *
+     * @return array<int>
+     */
+    public static function excluded_isolated_network_ids(): array
+    {
+        $configured_ids = self::get('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS', []);
+        if (is_string($configured_ids)) {
+            $configured_ids = explode(',', $configured_ids);
+        }
+        $network_ids = self::normalize_int_list($configured_ids);
+        $path = trim((string) self::get('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORKS_FILE', ''));
+        if ($path === '') {
+            sort($network_ids, SORT_NUMERIC);
+            return $network_ids;
+        }
+
+        if (!is_file($path) || !is_readable($path)) {
+            throw new \RuntimeException('Dedicated-network inventory is unavailable');
+        }
+
+        $size = filesize($path);
+        if ($size === false || $size > 16777216) {
+            throw new \RuntimeException('Dedicated-network inventory has an invalid size');
+        }
+
+        try {
+            $data = json_decode((string) file_get_contents($path), true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new \RuntimeException('Dedicated-network inventory is invalid JSON', 0, $e);
+        }
+
+        if (!is_array($data)) {
+            throw new \RuntimeException('Dedicated-network inventory must be a JSON array or object');
+        }
+
+        $file_ids = array_is_list($data) ? $data : array_keys($data['networks'] ?? []);
+        if (!array_is_list($data) && (!isset($data['networks']) || !is_array($data['networks']))) {
+            throw new \RuntimeException('Dedicated-network inventory is missing its networks object');
+        }
+
+        foreach ($file_ids as $network_id) {
+            if ((!is_int($network_id) && !is_string($network_id))
+                || !preg_match('/^[1-9][0-9]*$/', (string) $network_id)
+            ) {
+                throw new \RuntimeException('Dedicated-network inventory contains an invalid network ID');
+            }
+            $network_ids[] = (int) $network_id;
+        }
+
+        $network_ids = array_values(array_unique($network_ids));
+        sort($network_ids, SORT_NUMERIC);
+        return $network_ids;
+    }
+
     public static function memory_limit(): int
     {
         return (int) self::get('QUEUE_WORKER_MEMORY_LIMIT', 200);
