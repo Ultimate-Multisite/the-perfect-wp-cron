@@ -2,6 +2,7 @@ vendor/
 bin/vendor/
 node_modules/
 composer.lock
+!bin/composer.lock
 *.log
 *.pid
 assets/*.min.css

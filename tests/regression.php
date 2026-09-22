@@ -214,6 +214,12 @@ namespace {
         str_contains($worker_entrypoint, "require_once dirname(__DIR__) . '/src/class-bootstrap.php'"),
         'Worker entrypoint must load Bootstrap directly when plugin-local vendor autoload is absent from dist installs'
     );
+    assert_true(
+        str_contains($worker_entrypoint, 'Worker::$pidFile = $resolved_runtime_dir')
+            && str_contains($worker_entrypoint, 'Worker::$statusFile = $resolved_runtime_dir')
+            && str_contains($worker_entrypoint, 'Worker::$logFile = $resolved_runtime_dir'),
+        'Worker entrypoint must relocate mutable Workerman state for immutable deployments'
+    );
 
     $executor_entrypoint = file_get_contents(__DIR__ . '/../bin/execute-job.php');
     assert_true(is_string($executor_entrypoint), 'Executor entrypoint must be readable');
@@ -1586,6 +1592,10 @@ namespace {
     assert_same(12, Config::action_scheduler_rescan_interval(), 'AS rescan interval must be configurable');
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL=0');
     assert_same(1, Config::action_scheduler_rescan_interval(), 'AS rescan interval must be clamped to at least one second');
+
+    putenv('QUEUE_WORKER_RUNTIME_DIR=/tmp/queue-worker-runtime');
+    assert_same('/tmp/queue-worker-runtime', Config::runtime_dir(), 'Workerman runtime directory must be configurable');
+    putenv('QUEUE_WORKER_RUNTIME_DIR');
 
     putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS=53, 49,53');
     assert_same([49, 53], Config::excluded_isolated_network_ids(), 'Explicit isolated-network exclusions must be normalized and sorted');

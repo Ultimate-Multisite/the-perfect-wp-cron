@@ -17,6 +17,11 @@ class Config
         return self::get('QUEUE_WORKER_SOCKET_PATH', '/tmp/the-perfect-wp-cron.sock');
     }
 
+    public static function runtime_dir(): string
+    {
+        return trim((string) self::get('QUEUE_WORKER_RUNTIME_DIR', ''));
+    }
+
     public static function worker_count(): int
     {
         return (int) self::get('QUEUE_WORKER_COUNT', 2);

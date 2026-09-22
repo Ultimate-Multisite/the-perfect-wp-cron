@@ -72,6 +72,26 @@ $socket_path    = Config::socket_path();
 $primary_domain = getenv('DOMAIN_CURRENT_SITE') ?: 'localhost';
 $execute_script = __DIR__ . '/execute-job.php';
 $scan_script    = __DIR__ . '/scan-cron.php';
+$runtime_dir    = Config::runtime_dir();
+
+// Workerman stores its PID, status and internal log beside the start script by
+// default. Immutable deployments can provide a private writable runtime path.
+if ($runtime_dir !== '') {
+    $resolved_runtime_dir = realpath($runtime_dir);
+    if ($runtime_dir[0] !== '/'
+        || str_contains($runtime_dir, "\0")
+        || $resolved_runtime_dir === false
+        || !is_dir($resolved_runtime_dir)
+        || !is_writable($resolved_runtime_dir)
+    ) {
+        fwrite(STDERR, "ERROR: QUEUE_WORKER_RUNTIME_DIR must be an absolute writable directory.\n");
+        exit(1);
+    }
+
+    Worker::$pidFile = $resolved_runtime_dir . '/workerman.pid';
+    Worker::$statusFile = $resolved_runtime_dir . '/workerman.status';
+    Worker::$logFile = $resolved_runtime_dir . '/workerman.log';
+}
 
 // --- Clean up stale socket file ---
 if (file_exists($socket_path)) {

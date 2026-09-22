@@ -96,6 +96,7 @@ Every setting can be configured via PHP constant (in `wp-config.php`) or environ
 | Constant / Env Var | Default | Description |
 |---|---|---|
 | `QUEUE_WORKER_SOCKET_PATH` | `/tmp/the-perfect-wp-cron.sock` | Unix socket path |
+| `QUEUE_WORKER_RUNTIME_DIR` | worker script directory | Writable directory for Workerman PID, status and internal log files; required when the plugin tree is read-only |
 | `QUEUE_WORKER_COUNT` | `2` | Number of worker processes (Workerman forks) |
 | `QUEUE_WORKER_MAX_CONCURRENT` | `1` | Max concurrent subprocesses per worker |
 | `QUEUE_WORKER_MAX_BATCH_SIZE` | `50` | Max jobs per subprocess batch |
