@@ -96,6 +96,7 @@ Every setting can be configured via PHP constant (in `wp-config.php`) or environ
 | Constant / Env Var | Default | Description |
 |---|---|---|
 | `QUEUE_WORKER_SOCKET_PATH` | `/tmp/the-perfect-wp-cron.sock` | Unix socket path |
+| `QUEUE_WORKER_RUNTIME_DIR` | worker script directory | Writable directory for Workerman PID, status and internal log files; required when the plugin tree is read-only |
 | `QUEUE_WORKER_COUNT` | `2` | Number of worker processes (Workerman forks) |
 | `QUEUE_WORKER_MAX_CONCURRENT` | `1` | Max concurrent subprocesses per worker |
 | `QUEUE_WORKER_MAX_BATCH_SIZE` | `50` | Max jobs per subprocess batch |
@@ -104,6 +105,8 @@ Every setting can be configured via PHP constant (in `wp-config.php`) or environ
 | `QUEUE_WORKER_RESCAN_INTERVAL` | `60` | Seconds between database rescans |
 | `QUEUE_WORKER_SCHEDULING_HORIZON` | `3600` | Only keep timers for jobs due within this many seconds; never shorter than the rescan interval |
 | `QUEUE_WORKER_SCAN_TIMEOUT` | `300` | Full-network scanner subprocess timeout in seconds |
+| `QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS` | empty | Comma-separated isolated network IDs owned by dedicated workers |
+| `QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORKS_FILE` | empty | JSON array of dedicated network IDs, or an inventory object with a `networks` object keyed by ID; re-read before each scan and fail-closed if invalid |
 | `QUEUE_WORKER_BYPASS_CRON_HOOKS` | empty | Additional comma-separated WP-Cron hooks for the worker to ignore |
 | `QUEUE_WORKER_MANAGED_CRON_HOOKS` | empty | Comma-separated default-bypassed hooks that this worker should manage |
 | `QUEUE_WORKER_MEMORY_LIMIT` | `200` | Memory limit in MB before draining and recycling the event-loop child |

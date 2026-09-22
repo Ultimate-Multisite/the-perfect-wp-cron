@@ -168,8 +168,27 @@ function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): 
     $payloads = [];
     $deadline = time() + $scan_timeout;
     $sovereign_sites = qw_scan_sovereign_site_entries();
-    $isolated_networks = qw_scan_isolated_network_entries();
+    $excluded_networks = null;
+    try {
+        $excluded_networks = array_fill_keys(Config::excluded_isolated_network_ids(), true);
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Dedicated-network exclusion inventory is unavailable; isolated scans are blocked.\n");
+    }
+
+    $registry_available = true;
+    try {
+        $all_isolated_networks = qw_scan_isolated_network_entries(false, true);
+    } catch (\Throwable $e) {
+        $registry_available = false;
+        $all_isolated_networks = [];
+        fwrite(STDERR, "Isolated-network registry is unavailable; secondary-network scans are blocked.\n");
+    }
+    $isolated_networks = $excluded_networks === null || !$registry_available
+        ? []
+        : array_diff_key($all_isolated_networks, $excluded_networks);
     $initial_blog_id = get_current_blog_id();
+    $current_site = get_site($initial_blog_id);
+    $current_network_id = $current_site ? (int) $current_site->site_id : 0;
     $site_ids = is_multisite() ? get_sites(['number' => 0, 'fields' => 'ids']) : [$initial_blog_id];
 
     foreach ($site_ids as $site_id) {
@@ -180,7 +199,12 @@ function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): 
 
         $site = get_site($site_id);
         $network_id = $site ? (int) $site->site_id : 0;
-        if (isset($isolated_networks[$network_id])) {
+        if ((!$registry_available || $excluded_networks === null) && $network_id !== $current_network_id) {
+            continue;
+        }
+        if (isset($all_isolated_networks[$network_id])
+            || ($excluded_networks !== null && isset($excluded_networks[$network_id]))
+        ) {
             continue;
         }
 
@@ -325,14 +349,27 @@ function qw_scan_sovereign_site_entries(): array
     return $entries;
 }
 
-function qw_scan_isolated_network_entries(): array
+function qw_scan_isolated_network_entries(bool $exclude_dedicated = true, bool $strict_registry = false): array
 {
     if (!defined('WP_CONTENT_DIR')) {
         return [];
     }
 
+    $excluded_networks = [];
+    if ($exclude_dedicated) {
+        try {
+            $excluded_networks = array_fill_keys(Config::excluded_isolated_network_ids(), true);
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "Dedicated-network exclusion inventory is unavailable; isolated scans are blocked.\n");
+            return [];
+        }
+    }
+
     $data = qw_scan_registry_data(WP_CONTENT_DIR . '/network-registry.data.json');
-    if (empty($data['networks']) || !is_array($data['networks'])) {
+    if (!array_key_exists('networks', $data) || !is_array($data['networks'])) {
+        if ($strict_registry) {
+            throw new RuntimeException('Isolated-network registry is unavailable or invalid');
+        }
         return [];
     }
 
@@ -347,7 +384,7 @@ function qw_scan_isolated_network_entries(): array
         }
 
         $network_id = (int) ($entry['network_id'] ?? $entry['id'] ?? $registry_id);
-        if ($network_id > 0) {
+        if ($network_id > 0 && !isset($excluded_networks[$network_id])) {
             $entries[$network_id] = $entry;
         }
     }

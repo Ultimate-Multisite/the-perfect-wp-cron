@@ -214,6 +214,12 @@ namespace {
         str_contains($worker_entrypoint, "require_once dirname(__DIR__) . '/src/class-bootstrap.php'"),
         'Worker entrypoint must load Bootstrap directly when plugin-local vendor autoload is absent from dist installs'
     );
+    assert_true(
+        str_contains($worker_entrypoint, 'Worker::$pidFile = $resolved_runtime_dir')
+            && str_contains($worker_entrypoint, 'Worker::$statusFile = $resolved_runtime_dir')
+            && str_contains($worker_entrypoint, 'Worker::$logFile = $resolved_runtime_dir'),
+        'Worker entrypoint must relocate mutable Workerman state for immutable deployments'
+    );
 
     $executor_entrypoint = file_get_contents(__DIR__ . '/../bin/execute-job.php');
     assert_true(is_string($executor_entrypoint), 'Executor entrypoint must be readable');
@@ -1111,13 +1117,42 @@ namespace {
     ])), 'Network registry fixture must be writable');
     $registry_worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
     assert_same([49], array_keys(invoke_private($registry_worker, 'isolated_network_entries')), 'Only active, routable isolated network entries may be scanned');
+    $dedicated_networks_file = WP_CONTENT_DIR . '/dedicated-network-inventory.json';
+    assert_true(false !== file_put_contents($dedicated_networks_file, json_encode([
+        'networks' => [
+            53 => ['account' => 'tenant53'],
+        ],
+    ])), 'Dedicated-network inventory fixture must be writable');
+    putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORKS_FILE=' . $dedicated_networks_file);
     assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/network-registry.data.json', json_encode([
         'networks' => [
             49 => ['tier' => 'isolated', 'status' => 'active', 'domain' => 'isolated.example.test'],
             53 => ['tier' => 'isolated', 'status' => 'active', 'domains' => ['new-isolated.example.test']],
         ],
     ])), 'Updated network registry fixture must be writable');
-    assert_same([49, 53], array_keys(invoke_private($registry_worker, 'isolated_network_entries')), 'Every full-rescan lookup must re-read newly registered isolated networks');
+    assert_same([49], array_keys(invoke_private($registry_worker, 'isolated_network_entries')), 'Dedicated runtimes must be excluded from shared-worker scans');
+    assert_true(false !== file_put_contents($dedicated_networks_file, json_encode([
+        'networks' => [
+            49 => ['account' => 'tenant49'],
+        ],
+    ])), 'Updated dedicated-network inventory fixture must be writable');
+    assert_same([53], array_keys(invoke_private($registry_worker, 'isolated_network_entries')), 'Every full-rescan lookup must re-read dedicated runtime ownership');
+    assert_true(false !== file_put_contents($dedicated_networks_file, '{invalid'), 'Invalid dedicated-network inventory fixture must be writable');
+    \Workerman\Worker::$logs = [];
+    assert_same([], invoke_private($registry_worker, 'isolated_network_entries'), 'Invalid exclusion inventory must fail closed for isolated scans');
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), '[RESCAN][ISOLATED][BLOCKED]'),
+        'Invalid exclusion inventory must report that isolated scans are blocked'
+    );
+    assert_true(false !== file_put_contents($dedicated_networks_file, '{}'), 'Empty object exclusion inventory fixture must be writable');
+    try {
+        Config::excluded_isolated_network_ids();
+        throw new RuntimeException('An inventory object without networks must fail closed');
+    } catch (RuntimeException $exception) {
+        assert_true(str_contains($exception->getMessage(), 'missing its networks object'), 'An empty inventory object must report its missing networks map');
+    }
+    putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORKS_FILE');
+    assert_true(unlink($dedicated_networks_file), 'Dedicated-network inventory fixture must be removed');
     assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/network-registry.data.json', json_encode([
         'networks' => [
             12 => ['tier' => 'isolated', 'status' => 'active', 'domain' => 'isolated.example.test'],
@@ -1180,9 +1215,29 @@ namespace {
     $GLOBALS['test_crons'] = [];
     \Workerman\Timer::$delays = [];
     $root_scan_worker = new Worker_Process(__FILE__, 'example.test', __FILE__, $isolated_scan_fixture);
+    putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS=12');
+    invoke_private($root_scan_worker, 'rescan_all_jobs');
+    assert_true(!in_array(175, $GLOBALS['test_switched_blogs'], true), 'Root scanning must skip a dedicated network proxy instead of scanning it through the shared database context');
+    assert_same([], \Workerman\Timer::$delays, 'A dedicated network must not run through either the shared root scan or isolated scanner');
+    assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/network-registry.data.json', '{invalid'), 'Invalid network registry fixture must be writable');
+    $GLOBALS['test_switched_blogs'] = [];
+    \Workerman\Worker::$logs = [];
+    invoke_private($root_scan_worker, 'rescan_all_jobs');
+    assert_true(!in_array(175, $GLOBALS['test_switched_blogs'], true), 'An unavailable registry must fail closed instead of scanning secondary-network proxies through the root context');
+    assert_same([], \Workerman\Timer::$delays, 'An unavailable registry must block isolated scanner dispatch');
+    assert_true(
+        str_contains(implode("\n", \Workerman\Worker::$logs), 'Isolated-network registry is unavailable'),
+        'An unavailable registry must report that secondary-network scans are blocked'
+    );
+    assert_true(false !== file_put_contents(WP_CONTENT_DIR . '/network-registry.data.json', json_encode([
+        'networks' => [
+            12 => ['tier' => 'isolated', 'status' => 'active', 'domain' => 'isolated.example.test'],
+        ],
+    ])), 'Restored network registry fixture must be writable');
+    putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS');
     invoke_private($root_scan_worker, 'rescan_all_jobs');
     assert_true(!in_array(175, $GLOBALS['test_switched_blogs'], true), 'Root scanning must skip proxy blog 175 because it belongs to isolated network 12');
-    assert_same(1, count(\Workerman\Timer::$delays), 'A root full rescan must include the isolated tenant scanner result');
+    assert_same(1, count(\Workerman\Timer::$delays), 'A shared root full rescan must include non-dedicated isolated scanner results');
     $GLOBALS['test_sites'] = [1];
     $GLOBALS['test_site_network_ids'] = [];
     assert_true(unlink($isolated_scan_fixture), 'Isolated scan fixture must be removed');
@@ -1537,6 +1592,27 @@ namespace {
     assert_same(12, Config::action_scheduler_rescan_interval(), 'AS rescan interval must be configurable');
     putenv('QUEUE_WORKER_AS_RESCAN_INTERVAL=0');
     assert_same(1, Config::action_scheduler_rescan_interval(), 'AS rescan interval must be clamped to at least one second');
+
+    putenv('QUEUE_WORKER_RUNTIME_DIR=/tmp/queue-worker-runtime');
+    assert_same('/tmp/queue-worker-runtime', Config::runtime_dir(), 'Workerman runtime directory must be configurable');
+    putenv('QUEUE_WORKER_RUNTIME_DIR');
+
+    putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS=53, 49,53');
+    assert_same([49, 53], Config::excluded_isolated_network_ids(), 'Explicit isolated-network exclusions must be normalized and sorted');
+    putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS=53,invalid');
+    try {
+        Config::excluded_isolated_network_ids();
+        throw new RuntimeException('Invalid explicit isolated-network exclusions must fail closed');
+    } catch (RuntimeException $exception) {
+        assert_true(str_contains($exception->getMessage(), 'invalid network ID'), 'Invalid explicit exclusions must report their validation failure');
+    }
+    putenv('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS');
+    assert_true(
+        str_contains($scan_script, 'Config::excluded_isolated_network_ids()')
+            && str_contains($scan_script, 'qw_scan_isolated_network_entries(false, true)')
+            && str_contains($scan_script, '$network_id !== $current_network_id'),
+        'The standalone full-network scanner must exclude dedicated scans while retaining proxy skip metadata'
+    );
 
     assert_true(Cron_Event_Filter::should_bypass('wp_update_plugins'), 'Bypass hook must be skipped by shared cron filter');
     assert_true(Cron_Event_Filter::should_bypass('action_scheduler_run_queue'), 'Action Scheduler queue runner must be skipped by shared cron filter');
