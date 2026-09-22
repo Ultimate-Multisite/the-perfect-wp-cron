@@ -928,9 +928,28 @@ class Worker_Process
     {
         $sites = get_sites(['number' => 0, 'fields' => 'ids']);
         $sovereign_sites = $this->sovereign_site_entries();
-        $isolated_networks = $this->isolated_network_entries();
+        $excluded_networks = null;
+        try {
+            $excluded_networks = array_fill_keys(Config::excluded_isolated_network_ids(), true);
+        } catch (\Throwable $e) {
+            Worker::log('[RESCAN][ISOLATED][BLOCKED] Dedicated-network exclusion inventory is unavailable.');
+        }
+
+        $registry_available = true;
+        try {
+            $all_isolated_networks = $this->isolated_network_entries(false, true);
+        } catch (\Throwable $e) {
+            $registry_available = false;
+            $all_isolated_networks = [];
+            Worker::log('[RESCAN][ISOLATED][BLOCKED] Isolated-network registry is unavailable.');
+        }
+        $isolated_networks = $excluded_networks === null || !$registry_available
+            ? []
+            : array_diff_key($all_isolated_networks, $excluded_networks);
 
         $current_blog_id = get_current_blog_id();
+        $current_site = get_site($current_blog_id);
+        $current_network_id = $current_site ? (int) $current_site->site_id : 0;
 
         foreach ($sites as $site_id) {
             $site_id = (int) $site_id;
@@ -940,7 +959,12 @@ class Worker_Process
 
             $site = get_site($site_id);
             $network_id = $site ? (int) $site->site_id : 0;
-            if (isset($isolated_networks[$network_id])) {
+            if ((!$registry_available || $excluded_networks === null) && $network_id !== $current_network_id) {
+                continue;
+            }
+            if (isset($all_isolated_networks[$network_id])
+                || ($excluded_networks !== null && isset($excluded_networks[$network_id]))
+            ) {
                 continue;
             }
 
@@ -1284,27 +1308,36 @@ class Worker_Process
      *
      * @return array<int, array>
      */
-    private function isolated_network_entries(): array
+    private function isolated_network_entries(bool $exclude_dedicated = true, bool $strict_registry = false): array
     {
         if (!defined('WP_CONTENT_DIR')) {
             return [];
         }
 
-        try {
-            $excluded_networks = array_fill_keys(Config::excluded_isolated_network_ids(), true);
-        } catch (\Throwable $e) {
-            Worker::log('[RESCAN][ISOLATED][BLOCKED] Dedicated-network exclusion inventory is unavailable.');
-            return [];
+        $excluded_networks = [];
+        if ($exclude_dedicated) {
+            try {
+                $excluded_networks = array_fill_keys(Config::excluded_isolated_network_ids(), true);
+            } catch (\Throwable $e) {
+                Worker::log('[RESCAN][ISOLATED][BLOCKED] Dedicated-network exclusion inventory is unavailable.');
+                return [];
+            }
         }
 
         $path = WP_CONTENT_DIR . '/network-registry.data.json';
         if (!is_readable($path)) {
+            if ($strict_registry) {
+                throw new \RuntimeException('Isolated-network registry is unavailable');
+            }
             return [];
         }
 
         $json = file_get_contents($path);
         $data = json_decode($json ?: '', true);
-        if (!is_array($data) || empty($data['networks']) || !is_array($data['networks'])) {
+        if (!is_array($data) || !array_key_exists('networks', $data) || !is_array($data['networks'])) {
+            if ($strict_registry) {
+                throw new \RuntimeException('Isolated-network registry is invalid');
+            }
             return [];
         }
 

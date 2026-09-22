@@ -183,9 +183,12 @@ class Config
     {
         $configured_ids = self::get('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS', []);
         if (is_string($configured_ids)) {
-            $configured_ids = explode(',', $configured_ids);
+            $configured_ids = trim($configured_ids) === '' ? [] : explode(',', $configured_ids);
         }
-        $network_ids = self::normalize_int_list($configured_ids);
+        if (!is_array($configured_ids)) {
+            throw new \RuntimeException('Dedicated-network exclusions must be a list of network IDs');
+        }
+        $network_ids = self::strict_network_ids($configured_ids);
         $path = trim((string) self::get('QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORKS_FILE', ''));
         if ($path === '') {
             sort($network_ids, SORT_NUMERIC);
@@ -201,8 +204,13 @@ class Config
             throw new \RuntimeException('Dedicated-network inventory has an invalid size');
         }
 
+        $contents = file_get_contents($path);
+        if ($contents === false) {
+            throw new \RuntimeException('Dedicated-network inventory could not be read');
+        }
+
         try {
-            $data = json_decode((string) file_get_contents($path), true, 512, JSON_THROW_ON_ERROR);
+            $data = json_decode($contents, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             throw new \RuntimeException('Dedicated-network inventory is invalid JSON', 0, $e);
         }
@@ -211,21 +219,22 @@ class Config
             throw new \RuntimeException('Dedicated-network inventory must be a JSON array or object');
         }
 
-        $file_ids = array_is_list($data) ? $data : array_keys($data['networks'] ?? []);
-        if (!array_is_list($data) && (!isset($data['networks']) || !is_array($data['networks']))) {
-            throw new \RuntimeException('Dedicated-network inventory is missing its networks object');
-        }
-
-        foreach ($file_ids as $network_id) {
-            if ((!is_int($network_id) && !is_string($network_id))
-                || !preg_match('/^[1-9][0-9]*$/', (string) $network_id)
-            ) {
-                throw new \RuntimeException('Dedicated-network inventory contains an invalid network ID');
+        if (str_starts_with(ltrim($contents), '[')) {
+            if (!array_is_list($data)) {
+                throw new \RuntimeException('Dedicated-network inventory ID list is invalid');
             }
-            $network_ids[] = (int) $network_id;
+            $file_ids = $data;
+        } else {
+            if (!isset($data['networks']) || !is_array($data['networks'])) {
+                throw new \RuntimeException('Dedicated-network inventory is missing its networks object');
+            }
+            $file_ids = array_keys($data['networks']);
         }
 
-        $network_ids = array_values(array_unique($network_ids));
+        $network_ids = array_values(array_unique(array_merge(
+            $network_ids,
+            self::strict_network_ids($file_ids)
+        )));
         sort($network_ids, SORT_NUMERIC);
         return $network_ids;
     }
@@ -297,6 +306,23 @@ class Config
         }
 
         return array_values(array_unique(array_filter($result)));
+    }
+
+    private static function strict_network_ids(array $items): array
+    {
+        $network_ids = [];
+        foreach ($items as $network_id) {
+            if (!is_int($network_id) && !is_string($network_id)) {
+                throw new \RuntimeException('Dedicated-network exclusions contain an invalid network ID');
+            }
+            $network_id = trim((string) $network_id);
+            if (!preg_match('/^[1-9][0-9]*$/', $network_id)) {
+                throw new \RuntimeException('Dedicated-network exclusions contain an invalid network ID');
+            }
+            $network_ids[] = (int) $network_id;
+        }
+
+        return array_values(array_unique($network_ids));
     }
 
     private static function normalize_string_list(mixed $value): array
