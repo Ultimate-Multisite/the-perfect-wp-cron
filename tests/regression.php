@@ -227,6 +227,22 @@ namespace {
         str_contains($executor_entrypoint, "define('QUEUE_WORKER_EXECUTOR_RUNNING', true)"),
         'Executor subprocesses must identify themselves before WordPress loads'
     );
+    $executor_discovery = strpos($executor_entrypoint, 'QueueWorker\\Bootstrap::discover_wp_load');
+    $executor_abspath = strpos($executor_entrypoint, "define('ABSPATH'");
+    $executor_site_autoload = strpos($executor_entrypoint, 'require_once $site_autoload;');
+    assert_true(
+        $executor_discovery !== false
+            && $executor_abspath !== false
+            && $executor_site_autoload !== false
+            && $executor_discovery < $executor_site_autoload
+            && $executor_abspath < $executor_site_autoload,
+        'Executor must honor WP_ROOT_PATH and define ABSPATH before loading the site autoloader'
+    );
+    assert_true(
+        str_contains($executor_entrypoint, "require_once dirname(__DIR__) . '/src/class-bootstrap.php'")
+            && !str_contains($executor_entrypoint, 'function qw_discover_wp_load'),
+        'Executor must use the shared Bootstrap discovery contract in distribution installs'
+    );
 
     $scanner_entrypoint = file_get_contents(__DIR__ . '/../bin/scan-cron.php');
     assert_true(is_string($scanner_entrypoint), 'Scanner entrypoint must be readable');
