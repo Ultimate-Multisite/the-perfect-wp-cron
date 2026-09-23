@@ -46,10 +46,13 @@ $plugin_autoload = dirname(__DIR__) . '/vendor/autoload.php';
 if (file_exists($plugin_autoload)) {
     require_once $plugin_autoload;
 }
+if (!class_exists('QueueWorker\\Bootstrap')) {
+    require_once dirname(__DIR__) . '/src/class-bootstrap.php';
+}
 
 // Discover WordPress before loading the site Composer autoloader. Bedrock's
 // autoloaded plugin files may exit when ABSPATH has not been defined yet.
-$wp_load = qw_discover_wp_load(__DIR__);
+$wp_load = QueueWorker\Bootstrap::discover_wp_load(__DIR__);
 if (!defined('ABSPATH')) {
     define('ABSPATH', rtrim(dirname($wp_load), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR);
 }
@@ -186,32 +189,4 @@ function qw_payload_matches_sovereign_registry(int $site_id, string $domain): bo
 
     $domains = array_map('strtolower', array_map('strval', $entry['domains'] ?? []));
     return in_array(strtolower($domain), $domains, true);
-}
-
-function qw_discover_wp_load(string $start_dir): string
-{
-    $dir = $start_dir;
-
-    while (true) {
-        $candidates = [
-            $dir . '/wp-load.php',
-            $dir . '/web/wp/wp-load.php',
-            $dir . '/web/wp-load.php',
-        ];
-
-        foreach ($candidates as $candidate) {
-            if (file_exists($candidate)) {
-                return $candidate;
-            }
-        }
-
-        $parent = dirname($dir);
-        if ($parent === $dir) {
-            break;
-        }
-        $dir = $parent;
-    }
-
-    fwrite(STDERR, "Could not locate wp-load.php.\n");
-    exit(1);
 }
