@@ -95,6 +95,7 @@ $scheduling_horizon = max(1, (int) ($payload['scheduling_horizon'] ?? Config::sc
 $scan_timeout = max(1, (int) ($payload['scan_timeout'] ?? Config::scan_timeout()));
 $payloads = [];
 $isolated_network_id = (int) ($payload['isolated_network_id'] ?? 0);
+$shared_network_id = (int) ($payload['shared_network_id'] ?? 0);
 if (!empty($payload['full_network'])) {
     $payloads = qw_scan_full_network_jobs($scheduling_horizon, $scan_timeout);
 } elseif ($isolated_network_id > 0) {
@@ -127,6 +128,52 @@ if (!empty($payload['full_network'])) {
 
     if ($initial_blog_id !== get_current_blog_id()) {
         switch_to_blog($initial_blog_id);
+    }
+} elseif ($shared_network_id > 0) {
+    $network = get_network($shared_network_id);
+    if (!is_multisite()
+        || $shared_network_id !== get_current_network_id()
+        || !$network
+        || strtolower(rtrim((string) $network->domain, '.')) !== strtolower(rtrim($domain, '.'))
+    ) {
+        fwrite(STDERR, "Shared network scan URL does not resolve to the expected network.\n");
+        exit(1);
+    }
+
+    try {
+        $excluded_networks = Config::excluded_isolated_network_ids();
+        $isolated_networks = qw_scan_isolated_network_entries(false, true);
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Shared network scan cannot verify network ownership.\n");
+        exit(1);
+    }
+    if (in_array($shared_network_id, $excluded_networks, true)
+        || isset($isolated_networks[$shared_network_id])
+    ) {
+        fwrite(STDERR, "Shared network scan cannot enter an isolated network.\n");
+        exit(1);
+    }
+
+    $initial_blog_id = get_current_blog_id();
+    $site_ids = get_sites(['number' => 0, 'fields' => 'ids', 'network_id' => $shared_network_id]);
+    foreach ($site_ids as $site_id) {
+        $site = get_site((int) $site_id);
+        if (!$site || (int) $site->site_id !== $shared_network_id) {
+            fwrite(STDERR, "Shared network scan encountered a foreign site.\n");
+            exit(1);
+        }
+        $switched = (int) $site_id !== get_current_blog_id();
+        if ($switched) {
+            switch_to_blog((int) $site_id);
+        }
+        $payloads = array_merge($payloads, qw_scan_current_site_jobs($scheduling_horizon));
+        if ($switched) {
+            restore_current_blog();
+        }
+    }
+    if ($initial_blog_id !== get_current_blog_id()) {
+        fwrite(STDERR, "Shared network scan did not restore its initial site.\n");
+        exit(1);
     }
 } else {
     $site_id = (int) ($payload['site_id'] ?? get_current_blog_id());
@@ -189,7 +236,9 @@ function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): 
     $initial_blog_id = get_current_blog_id();
     $current_site = get_site($initial_blog_id);
     $current_network_id = $current_site ? (int) $current_site->site_id : 0;
-    $site_ids = is_multisite() ? get_sites(['number' => 0, 'fields' => 'ids']) : [$initial_blog_id];
+    $site_ids = is_multisite()
+        ? get_sites(['number' => 0, 'fields' => 'ids', 'network_id' => $current_network_id])
+        : [$initial_blog_id];
 
     foreach ($site_ids as $site_id) {
         $site_id = (int) $site_id;
@@ -222,6 +271,55 @@ function qw_scan_full_network_jobs(int $scheduling_horizon, int $scan_timeout): 
 
     if ($initial_blog_id !== get_current_blog_id()) {
         switch_to_blog($initial_blog_id);
+    }
+
+    // Multinetwork plugins deliberately scope unqualified get_sites() to the
+    // current network. Bootstrap every other shared network by its own verified
+    // domain so its network-active callbacks and AS tables are loaded correctly.
+    if (is_multisite() && $registry_available && $excluded_networks !== null) {
+        foreach (get_networks(['number' => 0, 'fields' => 'ids']) as $network_id) {
+            $network_id = (int) $network_id;
+            if ($network_id === $current_network_id
+                || isset($all_isolated_networks[$network_id])
+                || isset($excluded_networks[$network_id])
+            ) {
+                continue;
+            }
+
+            $network = get_network($network_id);
+            $network_domain = $network ? strtolower(rtrim((string) $network->domain, '.')) : '';
+            if ($network_id < 1
+                || !preg_match('/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/', $network_domain)
+            ) {
+                fwrite(STDERR, sprintf("Shared network %d has no valid bootstrap domain.\n", $network_id));
+                continue;
+            }
+
+            $remaining = $deadline - time();
+            if ($remaining <= 0) {
+                fwrite(STDERR, sprintf("Scan budget exhausted before shared network %d.\n", $network_id));
+                return $payloads;
+            }
+
+            $network_payloads = qw_scan_registry_jobs([
+                'shared_network_id' => $network_id,
+                'site_url' => 'https://' . $network_domain . '/',
+                'scheduling_horizon' => $scheduling_horizon,
+                'scan_timeout' => $remaining,
+            ], 'shared network ' . $network_id, $remaining);
+            foreach ($network_payloads as $network_payload) {
+                $site = get_site((int) ($network_payload['site_id'] ?? 0));
+                if (!$site
+                    || (int) $site->site_id !== $network_id
+                    || !empty($network_payload['isolated_network_id'])
+                    || !empty($network_payload['local_site_id'])
+                ) {
+                    fwrite(STDERR, sprintf("Shared network %d returned foreign routing metadata.\n", $network_id));
+                    continue;
+                }
+                $payloads[] = $network_payload;
+            }
+        }
     }
 
     foreach ($sovereign_sites as $site_id => $entry) {

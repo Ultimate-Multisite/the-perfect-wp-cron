@@ -1022,6 +1022,14 @@ namespace {
             && str_contains($scan_script, '$deadline = time() + $scheduling_horizon;'),
         'The scanner subprocess must enumerate the full network and reject jobs beyond the scheduling horizon'
     );
+    assert_true(
+        str_contains($scan_script, "'network_id' => \$current_network_id")
+            && str_contains($scan_script, "get_networks(['number' => 0, 'fields' => 'ids'])")
+            && str_contains($scan_script, "'shared_network_id' => \$network_id")
+            && str_contains($scan_script, '$shared_network_id !== get_current_network_id()')
+            && str_contains($scan_script, 'qw_scan_isolated_network_entries(false, true)'),
+        'Multinetwork scans must enumerate scoped sites and bootstrap other shared networks without entering isolated tenants'
+    );
 
     $async_scan_fixture = tempnam(sys_get_temp_dir(), 'qw-async-scan-');
     assert_true(false !== $async_scan_fixture, 'Asynchronous scan fixture must be created');
