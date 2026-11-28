@@ -164,6 +164,14 @@ class Config
         return max(1, self::rescan_interval(), (int) self::get('QUEUE_WORKER_SCHEDULING_HORIZON', 3600));
     }
 
+    /**
+     * Maximum stable per-site/hook delay (seconds) for recurring maintenance jobs; 0 disables.
+     */
+    public static function schedule_jitter(): int
+    {
+        return max(0, min(3600, (int) self::get('QUEUE_WORKER_SCHEDULE_JITTER', 0)));
+    }
+
     public static function scan_timeout(): int
     {
         return max(1, (int) self::get('QUEUE_WORKER_SCAN_TIMEOUT', 300));

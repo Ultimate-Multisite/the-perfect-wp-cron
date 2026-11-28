@@ -931,6 +931,23 @@ namespace {
         'The worker must not retain timers beyond its bounded scheduling horizon'
     );
 
+    $jitter_mk = fn(array $o) => new Job_Payload($o + [
+        'site_id' => 7, 'site_url' => 'https://tenant.example.test', 'hook' => 'jitter_cleanup_hook',
+        'args' => [], 'timestamp' => time() + 30, 'schedule' => 'hourly', 'interval' => 3600, 'source' => 'wp_cron',
+    ]);
+    $jitter_worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
+    assert_same(0, invoke_private($jitter_worker, 'jitter_for', [$jitter_mk([])]), 'Jitter must be off by default');
+    set_private_property($jitter_worker, 'schedule_jitter', 600);
+    $jitter_a = invoke_private($jitter_worker, 'jitter_for', [$jitter_mk([])]);
+    assert_same($jitter_a, invoke_private($jitter_worker, 'jitter_for', [$jitter_mk([])]), 'Jitter must be stable per site and hook');
+    assert_true($jitter_a >= 0 && $jitter_a <= 600, 'Jitter must stay within the window');
+    assert_true(invoke_private($jitter_worker, 'jitter_for', [$jitter_mk(['interval' => 20])]) <= 10, 'Jitter must be capped at half the interval');
+    assert_same(0, invoke_private($jitter_worker, 'jitter_for', [$jitter_mk(['schedule' => '', 'interval' => 0])]), 'One-shot events must not be jittered');
+    assert_same(0, invoke_private($jitter_worker, 'jitter_for', [$jitter_mk(['source' => 'action_scheduler'])]), 'Action Scheduler jobs must not be jittered');
+    assert_same(0, invoke_private($jitter_worker, 'jitter_for', [$jitter_mk(['timestamp' => time() - 5])]), 'Overdue jobs must not be jittered');
+    set_private_property($jitter_worker, 'urgent_hooks', ['jitter_cleanup_hook']);
+    assert_same(0, invoke_private($jitter_worker, 'jitter_for', [$jitter_mk([])]), 'Urgent hooks must not be jittered');
+
     Worker_Process::ensure_lock_table();
     assert_true(
         str_contains(implode("\n", $GLOBALS['wpdb']->queries), 'KEY claimed_at (claimed_at)'),
