@@ -108,6 +108,7 @@ Every setting can be configured via PHP constant (in `wp-config.php`) or environ
 | `QUEUE_WORKER_RESCAN_INTERVAL` | `60` | Seconds between database rescans |
 | `QUEUE_WORKER_AS_CLEANUP_IDLE_INTERVAL` | `21600` | Action Scheduler cleanup reschedules itself: 300 s after a full 100-row batch (draining a backlog), otherwise (or after an error) after this many seconds; minimum 300 |
 | `QUEUE_WORKER_SCHEDULING_HORIZON` | `3600` | Only keep timers for jobs due within this many seconds; never shorter than the rescan interval |
+| `QUEUE_WORKER_SCHEDULE_JITTER` | `0` | Max seconds (0-3600, `0` = off) of stable extra delay for recurring low-priority and maintenance jobs, derived from a hash of site and hook and capped at half the recurrence interval. Spreads bursts of simultaneous starts; adds up to this much latency (included in `wait_ms`) to those jobs. Never applied to urgent hooks, one-shot events, business recurring hooks, overdue jobs or Action Scheduler jobs |
 | `QUEUE_WORKER_SCAN_TIMEOUT` | `300` | Full-network scanner subprocess timeout in seconds |
 | `QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORK_IDS` | empty | Comma-separated isolated network IDs owned by dedicated workers |
 | `QUEUE_WORKER_EXCLUDED_ISOLATED_NETWORKS_FILE` | empty | JSON array of dedicated network IDs, or an inventory object with a `networks` object keyed by ID; re-read before each scan and fail-closed if invalid |

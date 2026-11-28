@@ -64,6 +64,7 @@ class Worker_Process
     private array $pending_as_batch = [];
 
     private int $running_jobs = 0;
+    private int $schedule_jitter = 0;
     private int $start_time;
     private bool $is_rescanning = false;
     /** @var array{process: resource, pipes: array, started: int, stdout: string, stderr: string}|null */
@@ -101,6 +102,7 @@ class Worker_Process
         $this->batch_timeout   = Config::batch_timeout();
         $this->rescan_interval = Config::rescan_interval();
         $this->scheduling_horizon = Config::scheduling_horizon();
+        $this->schedule_jitter = Config::schedule_jitter();
         $this->scan_timeout    = Config::scan_timeout();
         $this->memory_limit    = Config::memory_limit();
         $this->uptime_limit    = Config::uptime_limit();
@@ -326,9 +328,32 @@ class Worker_Process
         // payloads still need to run immediately, so schedule them on the next
         // event-loop tick instead of passing 0 to Timer::add().
         $delay = max(0.001, $payload->timestamp - time());
+        $delay += $this->jitter_for($payload);
         $timer_id = Timer::add($delay, fn($p) => $this->execute_job($p), [$payload], false);
         $this->pending_timers[$key] = $timer_id;
         $this->pending_timer_payloads[$key] = $payload;
+    }
+
+    /**
+     * Stable extra delay (seconds) for recurring maintenance payloads; 0 when off or excluded.
+     */
+    private function jitter_for(Job_Payload $payload): int
+    {
+        if ($this->schedule_jitter <= 0
+            || $payload->source === 'action_scheduler'
+            || !$payload->is_recurring()
+            || $payload->timestamp <= time()
+            || $this->payload_priority_rank($payload) < 35
+        ) {
+            return 0;
+        }
+
+        $cap = min($this->schedule_jitter, intdiv((int) $payload->interval, 2));
+        if ($cap <= 0) {
+            return 0;
+        }
+
+        return crc32($payload->site_id . ':' . $payload->hook) % ($cap + 1);
     }
 
     /**
