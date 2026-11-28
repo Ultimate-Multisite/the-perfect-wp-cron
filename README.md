@@ -97,6 +97,9 @@ Every setting can be configured via PHP constant (in `wp-config.php`) or environ
 |---|---|---|
 | `QUEUE_WORKER_SOCKET_PATH` | `/tmp/the-perfect-wp-cron.sock` | Unix socket path |
 | `QUEUE_WORKER_RUNTIME_DIR` | worker script directory | Writable directory for Workerman PID, status and internal log files; required when the plugin tree is read-only |
+| `QUEUE_WORKER_CLI_OPCACHE` | `0` | Set to `1` to run job and scanner subprocesses with a per-user opcache file cache (`opcache.enable_cli=1`), cutting WordPress bootstrap CPU. Ignored if the directory is a symlink, not owned by the worker UID, or unwritable |
+| `QUEUE_WORKER_OPCACHE_DIR` | `<runtime dir or system temp>/opcache` | Opcache file cache directory (mode 0700); never share between Unix users |
+| `QUEUE_WORKER_OPCACHE_MAX_AGE_DAYS` | `7` | Cache `*.bin` files older than this are pruned hourly |
 | `QUEUE_WORKER_COUNT` | `2` | Number of worker processes (Workerman forks) |
 | `QUEUE_WORKER_MAX_CONCURRENT` | `1` | Max concurrent subprocesses per worker |
 | `QUEUE_WORKER_MAX_BATCH_SIZE` | `50` | Max jobs per subprocess batch |
