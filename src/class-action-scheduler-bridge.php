@@ -7,6 +7,7 @@ class Action_Scheduler_Bridge
     public const CLEANUP_HOOK = 'qw_cleanup_action_scheduler';
     private const CLEANUP_SCHEDULE = 'qw_every_five_minutes';
     private const CLEANUP_BATCH_SIZE = 100;
+    private const CLEANUP_DRAIN_DELAY = 300;
     private static bool $stored_action_hook_registered = false;
 
     public static function register(): void
@@ -25,8 +26,13 @@ class Action_Scheduler_Bridge
 
         // process_action() bypasses QueueRunner::run(), including its cleaner.
         // Use a worker-managed cron event, not a second AS queue runner.
-        if (!self::has_native_cleanup() && !wp_next_scheduled(self::CLEANUP_HOOK)) {
-            wp_schedule_event(time() + 300, self::CLEANUP_SCHEDULE, self::CLEANUP_HOOK);
+        if (!self::has_native_cleanup()) {
+            // Convert a legacy recurring event into the adaptive single event.
+            $existing = wp_get_scheduled_event(self::CLEANUP_HOOK);
+            if (is_object($existing) && !empty($existing->schedule)) {
+                wp_clear_scheduled_hook(self::CLEANUP_HOOK);
+            }
+            self::schedule_next(self::CLEANUP_DRAIN_DELAY);
         }
     }
 
@@ -47,11 +53,33 @@ class Action_Scheduler_Bridge
             && wp_next_scheduled('action_scheduler_run_actions_cleanup_hook') !== false;
     }
 
+    private static function schedule_next(int $delay): void
+    {
+        if (wp_next_scheduled(self::CLEANUP_HOOK) === false) {
+            wp_schedule_single_event(time() + $delay, self::CLEANUP_HOOK);
+        }
+    }
+
     public static function cleanup(): void
     {
         if (self::has_native_cleanup()) {
             return;
         }
+
+        // Failures and clean queues wake rarely; only a full batch drains fast.
+        $delay = Config::action_scheduler_cleanup_idle_interval();
+        try {
+            $deleted = self::run_cleanup();
+            if ($deleted >= self::CLEANUP_BATCH_SIZE) {
+                $delay = self::CLEANUP_DRAIN_DELAY;
+            }
+        } finally {
+            self::schedule_next($delay);
+        }
+    }
+
+    private static function run_cleanup(): int
+    {
         if (!class_exists('ActionScheduler_QueueCleaner')) {
             throw new \RuntimeException('Action Scheduler cleaner is unavailable');
         }
@@ -66,17 +94,18 @@ class Action_Scheduler_Bridge
             (array) apply_filters('action_scheduler_default_cleaner_statuses', $allowed)
         ));
         if ($statuses === []) {
-            return;
+            return 0;
         }
 
         // Exactly one bounded pass: at most 100 per terminal status. Never
         // reset claims, mark timeouts failed, or delete pending/failed actions.
         $cleaner = new \ActionScheduler_QueueCleaner();
-        $cleaner->clean_actions(
+        $deleted = $cleaner->clean_actions(
             $statuses,
             as_get_datetime_object(time() - $retention),
             self::CLEANUP_BATCH_SIZE
         );
+        return is_array($deleted) ? count($deleted) : 0;
     }
 
     public static function register_stored_action_hook(): void

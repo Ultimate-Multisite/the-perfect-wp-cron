@@ -174,6 +174,11 @@ class Config
         return max(1, (int) self::get('QUEUE_WORKER_AS_RESCAN_INTERVAL', 5));
     }
 
+    public static function action_scheduler_cleanup_idle_interval(): int
+    {
+        return max(300, (int) self::get('QUEUE_WORKER_AS_CLEANUP_IDLE_INTERVAL', 21600));
+    }
+
     /**
      * Isolated networks owned by dedicated workers must not also be scanned by
      * the shared worker. The optional inventory file is re-read for every scan
