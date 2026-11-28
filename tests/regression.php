@@ -165,8 +165,10 @@ namespace {
         public function clean_actions(array $statuses, DateTime $cutoff, int $batch_size): array
         {
             self::$calls[] = [$statuses, $cutoff->getTimestamp(), $batch_size];
-            return [];
+            return self::$result;
         }
+
+        public static array $result = [];
     }
 }
 
@@ -480,6 +482,28 @@ namespace {
         return true;
     }
 
+    function wp_schedule_single_event(int $timestamp, string $hook): bool
+    {
+        $GLOBALS['test_scheduled_hooks'][$hook] = $timestamp;
+        $GLOBALS['test_created_events'][] = [$timestamp, '', $hook];
+        return true;
+    }
+
+    function wp_get_scheduled_event(string $hook)
+    {
+        if (!isset($GLOBALS['test_scheduled_hooks'][$hook])) {
+            return false;
+        }
+        return (object) ['schedule' => $GLOBALS['test_event_schedule'][$hook] ?? false];
+    }
+
+    function wp_clear_scheduled_hook(string $hook): int
+    {
+        unset($GLOBALS['test_scheduled_hooks'][$hook], $GLOBALS['test_event_schedule'][$hook]);
+        $GLOBALS['test_cleared_hooks'][] = $hook;
+        return 1;
+    }
+
     function apply_filters(string $hook, $value)
     {
         return $GLOBALS['test_filter_values'][$hook] ?? $value;
@@ -662,8 +686,13 @@ namespace {
     assert_same($cleanup_hook, $GLOBALS['test_created_events'][0][2], 'Cleanup must have its own worker-managed hook');
     assert_same(false, Cron_Event_Filter::should_bypass($cleanup_hook), 'Maintenance must not use a bypassed AS runner hook');
     assert_same(300, QueueWorker\Action_Scheduler_Bridge::cleanup_schedule([])['qw_every_five_minutes']['interval'], 'Maintenance cadence must be bounded');
+    assert_same('', $GLOBALS['test_created_events'][0][1], 'Cleanup must be a single event');
     $cleanup_now = time();
+    $GLOBALS['test_scheduled_hooks'] = [];
+    $GLOBALS['test_created_events'] = [];
     QueueWorker\Action_Scheduler_Bridge::cleanup();
+    assert_same(1, count($GLOBALS['test_created_events']), 'Cleanup must reschedule exactly once');
+    assert_true(abs($GLOBALS['test_created_events'][0][0] - ($cleanup_now + 21600)) <= 2, 'Empty pass must wait the idle interval');
     assert_same(['complete', 'canceled'], ActionScheduler_QueueCleaner::$calls[0][0], 'Cleanup must only target terminal nonfailed statuses');
     assert_same(100, ActionScheduler_QueueCleaner::$calls[0][2], 'Cleanup must cap each status batch');
     assert_true(abs(ActionScheduler_QueueCleaner::$calls[0][1] - ($cleanup_now - 2678400)) <= 1, 'Cleanup must retain 31 days by default');
@@ -681,14 +710,35 @@ namespace {
     }
     assert_true($invalid_retention_rejected, 'Invalid retention must fail closed');
     assert_same(2, count(ActionScheduler_QueueCleaner::$calls), 'Invalid retention must not invoke the cleaner');
+    assert_same(1, count($GLOBALS['test_created_events']), 'Rejected pass must not stack events');
     $GLOBALS['test_filter_values'] = [];
+    $GLOBALS['test_scheduled_hooks'] = [];
+    $GLOBALS['test_created_events'] = [];
+    ActionScheduler_QueueCleaner::$result = range(1, 100);
+    QueueWorker\Action_Scheduler_Bridge::cleanup();
+    assert_true(abs($GLOBALS['test_created_events'][0][0] - (time() + 300)) <= 2, 'Full batch must drain after 300 s');
+    ActionScheduler_QueueCleaner::$result = range(1, 99);
+    $GLOBALS['test_scheduled_hooks'] = [];
+    $GLOBALS['test_created_events'] = [];
+    QueueWorker\Action_Scheduler_Bridge::cleanup();
+    assert_true(abs($GLOBALS['test_created_events'][0][0] - (time() + 21600)) <= 2, 'Partial batch must use idle interval');
+    ActionScheduler_QueueCleaner::$result = [];
+    $GLOBALS['test_scheduled_hooks'] = [$cleanup_hook => 1];
+    $GLOBALS['test_event_schedule'][$cleanup_hook] = 'qw_every_five_minutes';
+    $GLOBALS['test_created_events'] = [];
+    QueueWorker\Action_Scheduler_Bridge::register();
+    assert_same(1, count($GLOBALS['test_created_events']), 'Legacy recurring event must be replaced by one single event');
+    assert_same([$cleanup_hook], $GLOBALS['test_cleared_hooks'], 'Legacy recurring event must be cleared');
+    $GLOBALS['test_scheduled_hooks'] = [];
+    $GLOBALS['test_created_events'] = [];
     $GLOBALS['test_registered_hooks']['action_scheduler_run_actions_cleanup_hook'] = 10;
     $GLOBALS['test_scheduled_hooks']['action_scheduler_run_actions_cleanup_hook'] = time() + 60;
     QueueWorker\Action_Scheduler_Bridge::cleanup();
-    assert_same(2, count(ActionScheduler_QueueCleaner::$calls), 'An independent native cleaner must not be duplicated');
+    assert_same(0, count($GLOBALS['test_created_events']), 'Native cleanup must not get a bridge event');
+    assert_same(4, count(ActionScheduler_QueueCleaner::$calls), 'An independent native cleaner must not be duplicated');
     $GLOBALS['test_scheduled_hooks'] = [];
     QueueWorker\Action_Scheduler_Bridge::cleanup();
-    assert_same(3, count(ActionScheduler_QueueCleaner::$calls), 'A registered but unscheduled native hook must not suppress maintenance');
+    assert_same(5, count(ActionScheduler_QueueCleaner::$calls), 'A registered but unscheduled native hook must not suppress maintenance');
     $GLOBALS['test_registered_hooks'] = [];
     $GLOBALS['test_actions'] = [];
     $GLOBALS['test_filters'] = [];
