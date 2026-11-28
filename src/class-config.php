@@ -275,6 +275,78 @@ class Config
         return (int) self::get('QUEUE_WORKER_LOG_RETENTION', 7);
     }
 
+    public static function cli_opcache_enabled(): bool
+    {
+        return in_array(strtolower((string) self::get('QUEUE_WORKER_CLI_OPCACHE', '0')), ['1', 'true', 'on', 'yes'], true);
+    }
+
+    public static function cli_opcache_dir(): string
+    {
+        $dir = trim((string) self::get('QUEUE_WORKER_OPCACHE_DIR', ''));
+        if ($dir !== '') {
+            return rtrim($dir, '/');
+        }
+        $base = self::runtime_dir() !== '' ? self::runtime_dir() : sys_get_temp_dir();
+        return rtrim($base, '/') . '/opcache';
+    }
+
+    public static function cli_opcache_max_age_days(): int
+    {
+        return max(1, (int) self::get('QUEUE_WORKER_OPCACHE_MAX_AGE_DAYS', 7));
+    }
+
+    /** @return string[] PHP CLI arguments, or [] when disabled or unsafe. */
+    public static function cli_opcache_args(): array
+    {
+        if (!self::cli_opcache_enabled() || !extension_loaded('Zend OPcache')) {
+            return [];
+        }
+        $dir = self::cli_opcache_dir();
+        // Compiled code is executed, so the directory must be private to this UID.
+        if (is_link($dir) || (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir))) {
+            return [];
+        }
+        if (!function_exists('posix_geteuid') || fileowner($dir) !== posix_geteuid() || !is_writable($dir)) {
+            return [];
+        }
+        @chmod($dir, 0700);
+        return ['-d', 'opcache.enable_cli=1', '-d', 'opcache.file_cache=' . $dir];
+    }
+
+    /** Delete aged *.bin cache files (capped per pass); returns the number removed. */
+    public static function prune_cli_opcache(int $limit = 5000): int
+    {
+        $dir = self::cli_opcache_dir();
+        if (!self::cli_opcache_enabled() || is_link($dir) || !is_dir($dir)) {
+            return 0;
+        }
+        if (!function_exists('posix_geteuid') || fileowner($dir) !== posix_geteuid()) {
+            return 0;
+        }
+        $cutoff  = time() - self::cli_opcache_max_age_days() * 86400;
+        $removed = 0;
+        $seen    = 0;
+        try {
+            $it = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS)
+            );
+            foreach ($it as $file) {
+                if (++$seen > $limit) {
+                    break;
+                }
+                if ($file->isLink() || !$file->isFile() || $file->getExtension() !== 'bin') {
+                    continue;
+                }
+                if ($file->getMTime() < $cutoff && @unlink($file->getPathname())) {
+                    $removed++;
+                }
+            }
+        } catch (\Throwable $e) {
+            return $removed;
+        }
+        return $removed;
+    }
+
     private static function get(string $name, mixed $default): mixed
     {
         // PHP constant first

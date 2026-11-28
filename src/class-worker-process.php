@@ -180,6 +180,9 @@ class Worker_Process
             Timer::add($stagger, function () {}, null, false);
         }
 
+        $this->maintain_cli_opcache();
+        Timer::add(3600, fn() => $this->maintain_cli_opcache());
+
         // Memory and uptime watchdog
         Timer::add(30, function () use ($worker_id) {
             $this->notify_supervisor();
@@ -414,7 +417,7 @@ class Worker_Process
         $json_data = json_encode($json_array);
         // No shell wrapper: termination/reaping must address the actual PHP
         // executor, not leave its child running after a shell is killed.
-        $process = proc_open([PHP_BINARY, $this->execute_script, '--stdin'], [
+        $process = proc_open([PHP_BINARY, ...Config::cli_opcache_args(), $this->execute_script, '--stdin'], [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
             2 => ['pipe', 'w'],
@@ -1061,7 +1064,7 @@ class Worker_Process
             return false;
         }
 
-        $process = proc_open([PHP_BINARY, $this->scan_script, '--stdin'], [
+        $process = proc_open([PHP_BINARY, ...Config::cli_opcache_args(), $this->scan_script, '--stdin'], [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
             2 => ['pipe', 'w'],
@@ -1396,7 +1399,8 @@ class Worker_Process
             return;
         }
 
-        $cmd = sprintf('php %s --stdin', escapeshellarg($this->scan_script));
+        $opcache_args = implode('', array_map(static fn($a) => escapeshellarg($a) . ' ', Config::cli_opcache_args()));
+        $cmd = sprintf('php %s%s --stdin', $opcache_args, escapeshellarg($this->scan_script));
         $process = proc_open($cmd, [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
@@ -1982,6 +1986,21 @@ class Worker_Process
     /**
      * Check memory and uptime limits, trigger restart if exceeded.
      */
+    private function maintain_cli_opcache(): void
+    {
+        if (!Config::cli_opcache_enabled()) {
+            return;
+        }
+        if (Config::cli_opcache_args() === []) {
+            Worker::log('[OPCACHE] CLI opcache requested but disabled: extension or cache directory unsafe.');
+            return;
+        }
+        $removed = Config::prune_cli_opcache();
+        if ($removed > 0) {
+            Worker::log(sprintf('[OPCACHE] Pruned %d stale cache files.', $removed));
+        }
+    }
+
     private function check_limits(int $worker_id): void
     {
         if ($this->is_draining) {

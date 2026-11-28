@@ -608,6 +608,30 @@ namespace {
     require_once __DIR__ . '/../src/class-action-scheduler-bridge.php';
     require_once __DIR__ . '/../src/class-systemd-notifier.php';
 
+    $oc_base = sys_get_temp_dir() . '/qw-opcache-test-' . getmypid();
+    putenv('QUEUE_WORKER_CLI_OPCACHE');
+    assert_same([], QueueWorker\Config::cli_opcache_args(), 'Opcache args must be empty when disabled');
+    putenv('QUEUE_WORKER_CLI_OPCACHE=1');
+    putenv('QUEUE_WORKER_OPCACHE_DIR=' . $oc_base . '/cache');
+    if (extension_loaded('Zend OPcache') && function_exists('posix_geteuid')) {
+        $oc_args = QueueWorker\Config::cli_opcache_args();
+        assert_same(['-d', 'opcache.enable_cli=1', '-d', 'opcache.file_cache=' . $oc_base . '/cache'], $oc_args, 'Enabled opcache args must include owned directory');
+        assert_same('0700', substr(sprintf('%o', fileperms($oc_base . '/cache')), -4), 'Opcache directory must be 0700');
+        file_put_contents($oc_base . '/cache/old.bin', 'x');
+        touch($oc_base . '/cache/old.bin', time() - 30 * 86400);
+        file_put_contents($oc_base . '/cache/new.bin', 'x');
+        assert_same(1, QueueWorker\Config::prune_cli_opcache(), 'Prune must remove only aged bin files');
+        assert_true(file_exists($oc_base . '/cache/new.bin'), 'Prune must keep fresh files');
+        unlink($oc_base . '/cache/new.bin');
+        rmdir($oc_base . '/cache');
+        symlink(sys_get_temp_dir(), $oc_base . '/cache');
+        assert_same([], QueueWorker\Config::cli_opcache_args(), 'Symlinked opcache directory must be rejected');
+        unlink($oc_base . '/cache');
+    }
+    @rmdir($oc_base);
+    putenv('QUEUE_WORKER_CLI_OPCACHE');
+    putenv('QUEUE_WORKER_OPCACHE_DIR');
+
     $original_notify_socket = getenv('NOTIFY_SOCKET');
     putenv('NOTIFY_SOCKET');
     assert_true(QueueWorker\Systemd_Notifier::heartbeat(), 'Non-systemd environments must remain supported');
