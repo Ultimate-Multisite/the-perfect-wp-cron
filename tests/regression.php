@@ -948,6 +948,36 @@ namespace {
     set_private_property($jitter_worker, 'urgent_hooks', ['jitter_cleanup_hook']);
     assert_same(0, invoke_private($jitter_worker, 'jitter_for', [$jitter_mk([])]), 'Urgent hooks must not be jittered');
 
+    $co_worker = new Worker_Process(__FILE__, 'example.test', __FILE__);
+    $co_ts = time() + 1000;
+    $co_mk = fn(array $o) => new Job_Payload($o + [
+        'site_id' => 7, 'site_url' => 'https://tenant.example.test', 'hook' => 'co_cleanup_hook',
+        'schedule' => 'hourly', 'interval' => 3600, 'timestamp' => $co_ts, 'source' => 'wp_cron',
+    ]);
+    $co_for = fn(Job_Payload $p) => invoke_private($co_worker, 'coalesced_timestamp_for', [$p]);
+    assert_same($co_ts, $co_for($co_mk([])), 'Coalescing must be off by default');
+    set_private_property($co_worker, 'coalesce_window', 300);
+    set_private_property($co_worker, 'low_priority_hooks', ['co_cleanup_hook']);
+    $co_a = $co_for($co_mk([]));
+    assert_true($co_a >= $co_ts && $co_a - $co_ts < 300, 'Coalesced start must never be early and within one window');
+    assert_same(crc32('7') % 300, $co_a % 300, 'Slot must align to the per-site offset');
+    $co_b = $co_for($co_mk(['timestamp' => $co_a - 2]));
+    assert_same($co_a, $co_b, 'Same-slot payloads of one site must start together');
+    $co_offsets = [];
+    foreach ([1, 2, 3, 4, 5, 6] as $co_site) {
+        $co_offsets[$co_for($co_mk(['site_id' => $co_site])) % 300] = true;
+    }
+    assert_true(count($co_offsets) > 1, 'Different sites must use different offsets');
+    assert_same($co_ts, $co_for($co_mk(['schedule' => '', 'interval' => 0])), 'One-shots must not be coalesced');
+    assert_same($co_ts, $co_for($co_mk(['source' => 'action_scheduler'])), 'Action Scheduler jobs must not be coalesced');
+    $co_over = time() - 5;
+    assert_same($co_over, $co_for($co_mk(['timestamp' => $co_over])), 'Overdue jobs must not be coalesced');
+    set_private_property($co_worker, 'coalesce_exempt_hooks', ['co_*']);
+    assert_same($co_ts, $co_for($co_mk([])), 'Exempt hooks must not be coalesced');
+    set_private_property($co_worker, 'coalesce_exempt_hooks', []);
+    set_private_property($co_worker, 'urgent_hooks', ['co_cleanup_hook']);
+    assert_same($co_ts, $co_for($co_mk([])), 'Urgent hooks must not be coalesced');
+
     Worker_Process::ensure_lock_table();
     assert_true(
         str_contains(implode("\n", $GLOBALS['wpdb']->queries), 'KEY claimed_at (claimed_at)'),
