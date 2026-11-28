@@ -65,6 +65,9 @@ class Worker_Process
 
     private int $running_jobs = 0;
     private int $schedule_jitter = 0;
+    private int $coalesce_window = 0;
+    /** @var list<string> */
+    private array $coalesce_exempt_hooks = [];
     private int $start_time;
     private bool $is_rescanning = false;
     /** @var array{process: resource, pipes: array, started: int, stdout: string, stderr: string}|null */
@@ -103,6 +106,8 @@ class Worker_Process
         $this->rescan_interval = Config::rescan_interval();
         $this->scheduling_horizon = Config::scheduling_horizon();
         $this->schedule_jitter = Config::schedule_jitter();
+        $this->coalesce_window = Config::coalesce_window();
+        $this->coalesce_exempt_hooks = Config::coalesce_exempt_hooks();
         $this->scan_timeout    = Config::scan_timeout();
         $this->memory_limit    = Config::memory_limit();
         $this->uptime_limit    = Config::uptime_limit();
@@ -327,11 +332,41 @@ class Worker_Process
         // Workerman timers must use a positive interval. Due or overdue
         // payloads still need to run immediately, so schedule them on the next
         // event-loop tick instead of passing 0 to Timer::add().
-        $delay = max(0.001, $payload->timestamp - time());
-        $delay += $this->jitter_for($payload);
+        $due = $this->coalesced_timestamp_for($payload);
+        $delay = max(0.001, $due - time());
+        if ($due === $payload->timestamp) {
+            $delay += $this->jitter_for($payload);
+        }
         $timer_id = Timer::add($delay, fn($p) => $this->execute_job($p), [$payload], false);
         $this->pending_timers[$key] = $timer_id;
         $this->pending_timer_payloads[$key] = $payload;
+    }
+
+    /**
+     * Slot-aligned start time for eligible recurring low-priority payloads.
+     *
+     * Rounds the due time up to the next boundary of a per-site grid so that
+     * jobs of one site in the same slot start together and share a process.
+     * Returns the original timestamp when coalescing is off or excluded; never
+     * returns an earlier time. Takes precedence over jitter.
+     */
+    private function coalesced_timestamp_for(Job_Payload $payload): int
+    {
+        $timestamp = (int) $payload->timestamp;
+        $window = $this->coalesce_window;
+        if ($window <= 0
+            || $payload->source === 'action_scheduler'
+            || !$payload->is_recurring()
+            || $timestamp <= time()
+            || $this->payload_priority_rank($payload) < 35
+            || $this->hook_matches($payload->hook, $this->coalesce_exempt_hooks)
+        ) {
+            return $timestamp;
+        }
+
+        $offset = crc32((string) $payload->site_id) % $window;
+
+        return (int) (ceil(($timestamp - $offset) / $window) * $window + $offset);
     }
 
     /**

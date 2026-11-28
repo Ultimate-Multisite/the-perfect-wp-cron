@@ -172,6 +172,24 @@ class Config
         return max(0, min(3600, (int) self::get('QUEUE_WORKER_SCHEDULE_JITTER', 0)));
     }
 
+    /**
+     * Per-site slot grid (seconds) for coalescing recurring low-priority jobs; 0 disables.
+     */
+    public static function coalesce_window(): int
+    {
+        return max(0, min(3600, (int) self::get('QUEUE_WORKER_COALESCE_WINDOW', 0)));
+    }
+
+    /**
+     * Hook names or fnmatch patterns never delayed by coalescing.
+     *
+     * @return list<string>
+     */
+    public static function coalesce_exempt_hooks(): array
+    {
+        return self::normalize_string_list(self::get('QUEUE_WORKER_COALESCE_EXEMPT_HOOKS', []));
+    }
+
     public static function scan_timeout(): int
     {
         return max(1, (int) self::get('QUEUE_WORKER_SCAN_TIMEOUT', 300));
